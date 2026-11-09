@@ -1,12 +1,12 @@
 import { readdirSync, readFileSync } from 'node:fs';
 import { join } from 'node:path';
-import Fastify, { type FastifyReply, type FastifyRequest } from 'fastify';
+import express, { type NextFunction, type Request, type Response } from 'express';
 import { z } from 'zod';
 import { checkAgainstCatalogue } from '@sampledge/contracts';
-import { installAuth } from './auth';
+import { authMiddleware, bodyParser } from './auth';
 import type { Config } from './config';
-import { one, type Db } from './db';
-import { actorOf, forbidden, HttpError, parse, requireRole, type Actor } from './http';
+import { asJson, count, isDuplicateKey, one, type Db } from './db';
+import { actorOf, forbidden, HttpError, logError, parse, requireRole, type Actor } from './http';
 import { Supply360Client } from './supply360';
 import { failures, listRequests, replay, requestDetail, summary } from './modules/dashboard';
 import { browserReturn, enter, verifiedOutcome, type FlowResult } from './modules/entry';
@@ -23,49 +23,58 @@ const page = (title: string, message: string) => `<!doctype html><html lang="en"
 <style>body{font:16px/1.5 system-ui,sans-serif;margin:0;display:grid;place-items:center;min-height:100vh;background:#f6f7f9;color:#16181d}main{max-width:28rem;padding:2rem;background:#fff;border-radius:12px;box-shadow:0 1px 3px #0002;margin:1rem}h1{font-size:1.25rem;margin:0 0 .5rem}@media(prefers-color-scheme:dark){body{background:#111317;color:#e8eaee}main{background:#1b1e24}}</style>
 </head><body><main><h1>${escapeHtml(title)}</h1><p>${escapeHtml(message)}</p></main></body></html>`;
 
-function sendFlow(reply: FastifyReply, r: FlowResult) {
-  reply.header('cache-control', 'no-store').header('referrer-policy', 'no-referrer');
-  if ('redirect' in r) return reply.redirect(r.redirect, 302);
-  return reply.code(r.page.status).type('text/html; charset=utf-8').send(page(r.page.title, r.page.message));
+function sendFlow(res: Response, r: FlowResult) {
+  res.setHeader('cache-control', 'no-store');
+  res.setHeader('referrer-policy', 'no-referrer');
+  if ('redirect' in r) return void res.status(302).setHeader('location', r.redirect).end();
+  return void res.status(r.page.status).type('text/html; charset=utf-8').send(page(r.page.title, r.page.message));
 }
 
 /** Replays of a client write with the same Idempotency-Key return the first response. */
-async function idempotent(db: Db, req: FastifyRequest, reply: FastifyReply, fn: () => Promise<unknown>, okStatus = 200) {
+async function idempotent(db: Db, req: Request, res: Response, fn: () => Promise<unknown>, okStatus = 200) {
   const key = req.headers['idempotency-key'];
   const actor = actorOf(req);
-  if (typeof key !== 'string' || !key || actor.kind !== 'client') return reply.code(okStatus).send(await fn());
-  const prior = await one<{ status: number; response: unknown }>(db, 'SELECT status, response FROM idempotency_keys WHERE client_id=$1 AND key=$2', [actor.id, key]);
-  if (prior) return reply.code(prior.status).header('idempotent-replay', 'true').send(prior.response);
-  const out = await fn();
-  await db.query('INSERT INTO idempotency_keys (client_id, key, status, response) VALUES ($1,$2,$3,$4) ON CONFLICT DO NOTHING', [actor.id, key.slice(0, 200), okStatus, JSON.stringify(out)]);
-  return reply.code(okStatus).send(out);
+  if (typeof key !== 'string' || !key || actor.kind !== 'client') return void res.status(okStatus).json(await fn());
+  const prior = await one<{ status: number; response: unknown }>(db, 'idempotency_keys', { client_id: actor.id, key: key.slice(0, 200) });
+  if (prior) return void res.status(prior.status).setHeader('idempotent-replay', 'true').json(prior.response);
+  const out = asJson(await fn());
+  await db.col('idempotency_keys').insertOne({ client_id: actor.id, key: key.slice(0, 200), status: okStatus, response: out, created_at: new Date() })
+    .catch((e) => { if (!isDuplicateKey(e)) throw e; });
+  return void res.status(okStatus).json(out);
 }
 
 const staff = (a: Actor) => { requireRole(a, [...STAFF]); return a; };
 
+type Handler = (req: Request, res: Response) => Promise<unknown>;
+
 export function buildApp(db: Db, cfg: Config) {
-  const app = Fastify({ logger: process.env.NODE_ENV === 'test' ? false : { level: process.env.LOG_LEVEL ?? 'info' }, trustProxy: process.env.TRUST_PROXY === 'true' });
+  const app = express();
+  app.disable('x-powered-by');
+  app.set('etag', false);
+  if (process.env.TRUST_PROXY === 'true') app.set('trust proxy', true);
   const supply = new Supply360Client(cfg, db);
-  installAuth(app, db);
+  const auth = authMiddleware(db);
 
-  app.setErrorHandler((e, _req, reply) => {
-    if (e instanceof HttpError) return reply.code(e.status).send({ error: e.message, details: e.details });
-    const err = e as { statusCode?: number; message: string; name?: string };
-    if (err.name === 'Supply360Error') return reply.code(502).send({ error: err.message });
-    if (err.statusCode && err.statusCode < 500) return reply.code(err.statusCode).send({ error: err.message });
-    reply.log.error(e);
-    return reply.code(500).send({ error: 'Internal error' });
-  });
-  app.addHook('onSend', async (_req, reply) => { reply.header('x-content-type-options', 'nosniff').header('x-frame-options', 'DENY'); });
+  app.use((_req, res, next) => { res.setHeader('x-content-type-options', 'nosniff'); res.setHeader('x-frame-options', 'DENY'); next(); });
+  app.use(bodyParser());
 
-  app.get('/health', async () => {
-    const r = await one<{ pending: string; dead: string }>(db, "SELECT count(*) FILTER (WHERE status='pending') AS pending, count(*) FILTER (WHERE status='dead') AS dead FROM outbox");
-    return { ok: true, supply360: supply.connected ? 'configured' : 'not connected', outboxPending: Number(r?.pending ?? 0), outboxDead: Number(r?.dead ?? 0) };
+  /** Register a route: resolve the caller, run the handler, send what it returns as JSON. */
+  const on = (method: 'get' | 'post' | 'patch', path: string, fn: Handler) => {
+    app[method](path, auth, (req: Request, res: Response, next: NextFunction) => {
+      fn(req, res).then((out) => { if (!res.headersSent && out !== undefined) res.json(out); }, next);
+    });
+  };
+  const id = (req: Request) => String(req.params.id);
+  const query = (req: Request) => req.query as Record<string, string | undefined>;
+
+  on('get', '/health', async () => {
+    const [pending, dead] = await Promise.all([count(db, 'outbox', { status: 'pending' }), count(db, 'outbox', { status: 'dead' })]);
+    return { ok: true, supply360: supply.connected ? 'configured' : 'not connected', outboxPending: pending, outboxDead: dead };
   });
 
   // ---- Audience requests
-  app.post('/api/v1/audience-requests', async (req, reply) =>
-    idempotent(db, req, reply, async () => {
+  on('post', '/api/v1/audience-requests', async (req, res) =>
+    idempotent(db, req, res, async () => {
       const r = await createRequest(db, cfg, actorOf(req), req.body, async (text) => {
         const catalogue = await supply.attributes();
         const parsed = await parseTargeting(cfg, text, catalogue);
@@ -73,38 +82,38 @@ export function buildApp(db: Db, cfg: Config) {
       });
       return requestView(db, actorOf(req), r);
     }, 201));
-  app.get('/api/v1/audience-requests', async (req) => {
+  on('get', '/api/v1/audience-requests', async (req) => {
     const a = actorOf(req);
-    const q = req.query as Record<string, string | undefined>;
+    const q = query(req);
     if (a.kind === 'client') return { data: await listRequests(db, a, { platform: a.system === 'SUPPLY360' ? q.platform : a.system, status: q.status, country: q.country }) };
     return { data: await listRequests(db, staff(a), { platform: q.platform, status: q.status, country: q.country }) };
   });
-  app.get<{ Params: { id: string } }>('/api/v1/audience-requests/:id', async (req) => {
+  on('get', '/api/v1/audience-requests/:id', async (req) => {
     const a = actorOf(req);
-    const r = await loadRequest(db, req.params.id);
+    const r = await loadRequest(db, id(req));
     assertSee(a, r);
     return requestView(db, a, r);
   });
-  app.patch<{ Params: { id: string } }>('/api/v1/audience-requests/:id', async (req, reply) =>
-    idempotent(db, req, reply, async () => requestView(db, actorOf(req), await changeRequest(db, actorOf(req), req.params.id, req.body))));
-  app.post<{ Params: { id: string } }>('/api/v1/audience-requests/:id/feasibility', async (req) => {
+  on('patch', '/api/v1/audience-requests/:id', async (req, res) =>
+    idempotent(db, req, res, async () => requestView(db, actorOf(req), await changeRequest(db, actorOf(req), id(req), req.body))));
+  on('post', '/api/v1/audience-requests/:id/feasibility', async (req) => {
     const a = actorOf(req);
     if (a.kind === 'user') requireRole(a, ['supply_admin', 'supply_manager', 'supply_approver']);
-    return runFeasibility(db, cfg, supply, a, req.params.id);
+    return runFeasibility(db, cfg, supply, a, id(req));
   });
-  app.post<{ Params: { id: string }; Body: { note?: string; allocation?: Record<string, Record<string, number>> } }>('/api/v1/audience-requests/:id/approve', async (req) =>
-    requestView(db, actorOf(req), await decide(db, actorOf(req), req.params.id, true, req.body ?? {})));
-  app.post<{ Params: { id: string }; Body: { note?: string } }>('/api/v1/audience-requests/:id/reject', async (req) =>
-    requestView(db, actorOf(req), await decide(db, actorOf(req), req.params.id, false, req.body ?? {})));
-  app.post<{ Params: { id: string } }>('/api/v1/audience-requests/:id/launch', async (req) => launch(db, cfg, actorOf(req), req.params.id, req.body));
-  app.post<{ Params: { id: string } }>('/api/v1/audience-requests/:id/batches', async (req) => scheduleBatch(db, actorOf(req), req.params.id, req.body));
+  on('post', '/api/v1/audience-requests/:id/approve', async (req) =>
+    requestView(db, actorOf(req), await decide(db, actorOf(req), id(req), true, req.body ?? {})));
+  on('post', '/api/v1/audience-requests/:id/reject', async (req) =>
+    requestView(db, actorOf(req), await decide(db, actorOf(req), id(req), false, req.body ?? {})));
+  on('post', '/api/v1/audience-requests/:id/launch', async (req) => launch(db, cfg, actorOf(req), id(req), req.body));
+  on('post', '/api/v1/audience-requests/:id/batches', async (req) => scheduleBatch(db, actorOf(req), id(req), req.body));
   for (const [path, to] of [['pause', 'paused'], ['resume', 'resume'], ['close', 'closed'], ['cancel', 'cancelled']] as const) {
-    app.post<{ Params: { id: string }; Body: { reason?: string } }>(`/api/v1/audience-requests/:id/${path}`, async (req, reply) =>
-      idempotent(db, req, reply, async () => requestView(db, actorOf(req), await setStatus(db, actorOf(req), req.params.id, to, req.body?.reason))));
+    on('post', `/api/v1/audience-requests/:id/${path}`, async (req, res) =>
+      idempotent(db, req, res, async () => requestView(db, actorOf(req), await setStatus(db, actorOf(req), id(req), to, (req.body as { reason?: string } | undefined)?.reason))));
   }
-  app.get<{ Params: { id: string } }>('/api/v1/audience-requests/:id/report', async (req) => {
+  on('get', '/api/v1/audience-requests/:id/report', async (req) => {
     const a = actorOf(req);
-    const r = await loadRequest(db, req.params.id);
+    const r = await loadRequest(db, id(req));
     assertSee(a, r);
     const v = await requestView(db, a, r);
     const started = Object.values(v.outcomes).reduce((s, n) => s + n, 0);
@@ -118,13 +127,13 @@ export function buildApp(db: Db, cfg: Config) {
   });
 
   // ---- Outside sample partners: one entry link each; completes counted from verified outcomes
-  app.post<{ Params: { id: string } }>('/api/v1/audience-requests/:id/partners', async (req, reply) =>
-    idempotent(db, req, reply, async () => addPartner(db, cfg, actorOf(req), req.params.id, req.body), 201));
-  app.get<{ Params: { id: string } }>('/api/v1/audience-requests/:id/partners', async (req) => listPartners(db, cfg, actorOf(req), req.params.id));
-  app.post<{ Params: { id: string; ref: string } }>('/api/v1/audience-requests/:id/partners/:ref/close', async (req) => closePartner(db, cfg, actorOf(req), req.params.id, req.params.ref));
+  on('post', '/api/v1/audience-requests/:id/partners', async (req, res) =>
+    idempotent(db, req, res, async () => addPartner(db, cfg, actorOf(req), id(req), req.body), 201));
+  on('get', '/api/v1/audience-requests/:id/partners', async (req) => listPartners(db, cfg, actorOf(req), id(req)));
+  on('post', '/api/v1/audience-requests/:id/partners/:ref/close', async (req) => closePartner(db, cfg, actorOf(req), id(req), String(req.params.ref)));
 
   // ---- Targeting
-  app.post('/api/v1/targeting/parse', async (req) => {
+  on('post', '/api/v1/targeting/parse', async (req) => {
     const a = actorOf(req);
     if (a.kind === 'user') requireRole(a, ['supply_admin', 'supply_manager', 'supply_approver', 'viewer']);
     const { text } = parse(z.object({ text: z.string().min(3).max(2000) }), req.body);
@@ -133,49 +142,67 @@ export function buildApp(db: Db, cfg: Config) {
     return { ...parsed, problems: checkAgainstCatalogue(parsed.criteria, catalogue) };
   });
   // Staff and the source systems (PROJEXA maps its quota questions onto these attributes).
-  app.get('/api/v1/attributes', async (req) => {
+  on('get', '/api/v1/attributes', async (req) => {
     const a = actorOf(req);
     if (a.kind === 'user') staff(a);
     return { attributes: await supply.attributes() };
   });
 
   // ---- Events in
-  app.post('/api/v1/events', async (req) => receiveEvent(db, actorOf(req), req.body));
+  on('post', '/api/v1/events', async (req) => receiveEvent(db, actorOf(req), req.body));
 
   // ---- Respondent flow (public) and the host's signed outcome
-  app.get<{ Params: { token: string } }>('/go/:token', async (req, reply) => sendFlow(reply, await enter(db, cfg, supply, req.params.token)));
-  app.get<{ Params: { token: string }; Querystring: { pid?: string } }>('/p/:token', async (req, reply) => sendFlow(reply, await partnerEnter(db, req.params.token, req.query.pid)));
-  app.get<{ Params: { status: string }; Querystring: { token?: string; rid?: string } }>('/r/:status', async (req, reply) =>
-    sendFlow(reply, await browserReturn(db, cfg, supply, req.params.status, req.query.token ?? req.query.rid)));
-  app.post('/api/v1/s2s/outcome', async (req) => verifiedOutcome(db, (req.body ?? {}) as Record<string, unknown>));
+  on('get', '/go/:token', async (req, res) => sendFlow(res, await enter(db, cfg, supply, String(req.params.token))));
+  on('get', '/p/:token', async (req, res) => sendFlow(res, await partnerEnter(db, String(req.params.token), query(req).pid)));
+  on('get', '/r/:status', async (req, res) =>
+    sendFlow(res, await browserReturn(db, cfg, supply, String(req.params.status), query(req).token ?? query(req).rid)));
+  on('post', '/api/v1/s2s/outcome', async (req) => verifiedOutcome(db, (req.body ?? {}) as Record<string, unknown>));
 
   // ---- Dashboard
-  app.get('/api/v1/dashboard/summary', async (req) => summary(db, staff(actorOf(req))));
-  app.get('/api/v1/dashboard/requests', async (req) => ({ data: await listRequests(db, staff(actorOf(req)), req.query as Record<string, string>) }));
-  app.get<{ Params: { id: string } }>('/api/v1/dashboard/requests/:id', async (req) => requestDetail(db, staff(actorOf(req)), req.params.id));
-  app.get('/api/v1/dashboard/failures', async (req) => {
+  on('get', '/api/v1/dashboard/summary', async (req) => summary(db, staff(actorOf(req))));
+  on('get', '/api/v1/dashboard/requests', async (req) => ({ data: await listRequests(db, staff(actorOf(req)), query(req)) }));
+  on('get', '/api/v1/dashboard/requests/:id', async (req) => requestDetail(db, staff(actorOf(req)), id(req)));
+  on('get', '/api/v1/dashboard/failures', async (req) => {
     const a = staff(actorOf(req));
     if (a.role === 'org_viewer') throw forbidden();
     return failures(db);
   });
-  app.post<{ Params: { id: string } }>('/api/v1/dashboard/failures/:id/replay', async (req) => {
+  on('post', '/api/v1/dashboard/failures/:id/replay', async (req) => {
     requireRole(actorOf(req), ['supply_admin', 'supply_manager']);
     return replay(db, Number(req.params.id));
   });
-  app.get('/api/v1/me', async (req) => actorOf(req));
+  on('get', '/api/v1/me', async (req) => actorOf(req));
 
   const consoleHtml = readFileSync(join(__dirname, '..', '..', 'public', 'console.html'), 'utf8');
-  app.get('/console', async (_req, reply) => reply.type('text/html; charset=utf-8').header('cache-control', 'no-store').send(consoleHtml));
-  app.get('/', async (_req, reply) => reply.redirect('/console'));
+  on('get', '/console', async (_req, res) => void res.type('text/html; charset=utf-8').setHeader('cache-control', 'no-store').send(consoleHtml));
+  on('get', '/', async (_req, res) => void res.status(302).setHeader('location', '/console').end());
 
   // SampAudience brand assets (the product's display name; the service id stays "sampleon").
   const brandDir = join(__dirname, '..', '..', 'public', 'brand');
   const brandFiles = new Map(readdirSync(brandDir).filter((f) => /\.(svg|png)$/.test(f)).map((f) => [f, readFileSync(join(brandDir, f))]));
-  app.get<{ Params: { file: string } }>('/brand/:file', async (req, reply) => {
-    const body = brandFiles.get(req.params.file);
-    if (!body) return reply.code(404).send({ error: 'not_found' });
-    return reply.type(req.params.file.endsWith('.svg') ? 'image/svg+xml' : 'image/png')
-      .header('cache-control', 'public, max-age=86400').header('x-content-type-options', 'nosniff').send(body);
+  on('get', '/brand/:file', async (req, res) => {
+    const file = String(req.params.file);
+    const body = brandFiles.get(file);
+    if (!body) return void res.status(404).json({ error: 'not_found' });
+    res.setHeader('content-type', file.endsWith('.svg') ? 'image/svg+xml' : 'image/png');
+    res.setHeader('cache-control', 'public, max-age=86400');
+    return void res.send(body);
+  });
+
+  // Unknown routes and errors: the same JSON shapes as before.
+  app.use((req: Request, res: Response) => {
+    res.status(404).json({ message: `Route ${req.method}:${req.originalUrl} not found`, error: 'Not Found', statusCode: 404 });
+  });
+  app.use((e: unknown, _req: Request, res: Response, _next: NextFunction) => {
+    if (res.headersSent) return;
+    if (e instanceof HttpError) return void res.status(e.status).json({ error: e.message, details: e.details });
+    const err = e as { statusCode?: number; status?: number; message: string; name?: string; type?: string };
+    if (err.name === 'Supply360Error') return void res.status(502).json({ error: err.message });
+    if (err.type === 'entity.too.large') return void res.status(413).json({ error: 'Request body is too large' });
+    const code = err.statusCode ?? err.status;
+    if (code && code < 500) return void res.status(code).json({ error: err.message });
+    logError(e);
+    return void res.status(500).json({ error: 'Internal error' });
   });
 
   return { app, supply };

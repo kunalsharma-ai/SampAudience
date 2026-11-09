@@ -16,7 +16,6 @@ COPY --from=build /app/packages/contracts/package.json packages/contracts/
 COPY --from=build /app/packages/contracts/dist packages/contracts/dist
 COPY --from=build /app/apps/sampleon/package.json apps/sampleon/
 COPY --from=build /app/apps/sampleon/dist apps/sampleon/dist
-COPY --from=build /app/apps/sampleon/migrations apps/sampleon/migrations
 COPY --from=build /app/apps/sampleon/public apps/sampleon/public
 USER node
 EXPOSE 4600

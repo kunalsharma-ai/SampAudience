@@ -32,7 +32,7 @@ tested is in [docs/IMPLEMENTATION.md](docs/IMPLEMENTATION.md).
 
 ```
 packages/contracts   @sampledge/contracts: IDs, criteria, Audience Request, outcomes, signing, events (zod)
-apps/sampleon        The service (Fastify + PostgreSQL): API, worker, respondent flow, console
+apps/sampleon        The service (Express + MongoDB): API, worker, respondent flow, console
 e2e/ecosystem        Cross-service run of both workflows with the real SUPPLY360, ZAPX and PROJEXA
 ```
 
@@ -41,7 +41,9 @@ e2e/ecosystem        Cross-service run of both workflows with the real SUPPLY360
 ```bash
 npm ci
 npm run build
-export DATABASE_URL=postgresql://sampleon:sampleon@localhost:5432/sampleon
+# MongoDB 7 or later as a replica set (one node is enough; transactions need a replica set), e.g.
+#   mongod --replSet rs0 --dbpath ./data &  then once:  mongosh --eval 'rs.initiate()'
+export MONGODB_URL='mongodb://localhost:27017/sampleon?replicaSet=rs0'
 export SUPPLY360_URL=http://localhost:4000 SUPPLY360_SECRET=...      # SAMPLEON's secret at SUPPLY360
 node apps/sampleon/dist/src/admin.js client supply360 SUPPLY360 SUPPLY360 http://localhost:4000/api/v1/s2s/supply/events <same secret>
 node apps/sampleon/dist/src/admin.js client projexa PROJEXA PROJEXA https://projexa.example/api/v1/integrations/sampleon/events
@@ -51,13 +53,16 @@ node apps/sampleon/dist/src/admin.js user approver@example.com "Supply Approver"
 node apps/sampleon/dist/src/main.js        # API, worker and console on :4600 (console at /console)
 ```
 
-Every setting is in [apps/sampleon/.env.example](apps/sampleon/.env.example). Migrations run on
-start.
+Every setting is in [apps/sampleon/.env.example](apps/sampleon/.env.example). Collections and
+indexes are created on start (`src/migrate.ts`; also `node apps/sampleon/dist/src/migrate.js`).
+`DATABASE_URL` is still read when `MONGODB_URL` is not set.
 
 ## Tests
 
 ```bash
-npm test                     # contracts + service tests (needs PostgreSQL; TEST_ADMIN_DATABASE_URL)
+npm test                     # contracts + service tests on MongoDB: TEST_MONGODB_URL (a replica set; the
+                             # sampleon_test database is dropped), else a throwaway MongoDB is downloaded
+                             # once from fastdl.mongodb.org and started by mongodb-memory-server
 node e2e/ecosystem/run.mjs   # both workflows across the four real services (see e2e/ecosystem/README.md)
 ```
 

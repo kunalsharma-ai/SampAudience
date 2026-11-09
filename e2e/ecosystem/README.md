@@ -5,7 +5,7 @@
 1. **PROJEXA project → SAMPLEON → SUPPLY360 → panel → ZAPX → SAMPLEON → PROJEXA**
 2. **Independent ZAPX survey → SAMPLEON → SUPPLY360 → panel → ZAPX → SAMPLEON → ZAPX**
 
-It creates four empty databases (`sampleon_e2e`, `supply360_e2e`, `zapx_e2e`, `projexa_e2e`),
+It creates four empty databases (`sampleon_e2e` in MongoDB; `supply360_e2e`, `zapx_e2e`, `projexa_e2e` in PostgreSQL),
 migrates and seeds them, registers the service clients and two SAMPLEON staff users (a manager
 and a separate approver), starts the services on ports 4600–4630, drives the workflows over HTTP
 the way the products and a respondent's browser do, checks each system's records, and stops the
@@ -37,8 +37,9 @@ SUPPLY360_DIR=../Sampledge-full-Supply-CRM \
 ZAPX_DIR=../Sampledge-ZAPX \
 PROJEXA_DIR=../Projecxa \
 PG_ADMIN_URL=postgresql://postgres:postgres@localhost:5432/postgres \
+MONGO_E2E_URL='mongodb://localhost:27017/?replicaSet=rs0' \
 node e2e/ecosystem/run.mjs
 ```
 
-`PG_ADMIN_URL` must be a role that can create databases. The script drops and recreates only the
-four `*_e2e` databases.
+`PG_ADMIN_URL` must be a role that can create databases; `MONGO_E2E_URL` is a MongoDB replica set
+(SAMPLEON needs transactions). The script drops and recreates only the four `*_e2e` databases.

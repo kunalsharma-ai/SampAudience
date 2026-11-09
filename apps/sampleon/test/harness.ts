@@ -1,24 +1,36 @@
 /**
- * Test harness: a fresh database, SAMPLEON on a random port, a stand-in for the SUPPLY360
+ * Test harness: a fresh MongoDB database, SAMPLEON on a random port, a stand-in for the SUPPLY360
  * eligibility & delivery API (§5.1) that checks signatures, and an event sink for source systems.
  * The full cross-product run against the real SUPPLY360 is in the e2e/ folder.
  */
 import { createServer, type IncomingMessage, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
-import { Client } from 'pg';
 import {
   evaluate, outcomeSignature, parseEvent, signRequest, unixSeconds, verifyRequest,
   type AttributeDef, type Criterion, type EventEnvelope, type Profile,
 } from '@sampledge/contracts';
 import { buildApp } from '../src/app';
 import { loadConfig, type Config } from '../src/config';
-import { createPool, type Db } from '../src/db';
+import { createStore, type Db } from '../src/db';
 import { migrate } from '../src/migrate';
 import { createUser, upsertClient } from '../src/admin';
 import { tick } from '../src/worker';
 
-const ADMIN_URL = process.env.TEST_ADMIN_DATABASE_URL ?? 'postgresql://sampleon:sampleon@localhost:5432/postgres';
+/**
+ * MongoDB for the tests: TEST_MONGODB_URL (a replica set; the database sampleon_test is dropped
+ * and recreated), else a throwaway single-node replica set from mongodb-memory-server, which
+ * downloads MongoDB once on first use.
+ */
 const TEST_DB = 'sampleon_test';
+let memory: { getUri(): string; stop(): Promise<unknown> } | null = null;
+async function mongoUrl() {
+  if (process.env.TEST_MONGODB_URL) return process.env.TEST_MONGODB_URL;
+  if (!memory) {
+    const { MongoMemoryReplSet } = await import('mongodb-memory-server');
+    memory = await MongoMemoryReplSet.create({ replSet: { count: 1, storageEngine: 'wiredTiger' } });
+  }
+  return memory.getUri();
+}
 
 export const SECRETS = { supply360: 's360-secret', projexa: 'projexa-secret', zapx: 'zapx-secret', zapxOutcome: 'zapx-outcome-secret' };
 
@@ -127,24 +139,20 @@ export interface Harness {
 }
 
 export async function startHarness(over: Partial<Config> = {}): Promise<Harness> {
-  const admin = new Client({ connectionString: ADMIN_URL });
-  await admin.connect();
-  await admin.query(`DROP DATABASE IF EXISTS ${TEST_DB} WITH (FORCE)`);
-  await admin.query(`CREATE DATABASE ${TEST_DB}`);
-  await admin.end();
-  const url = new URL(ADMIN_URL); url.pathname = `/${TEST_DB}`;
+  const url = await mongoUrl();
 
   const supply = new FakeSupply360();
   const projexa = new EventSink(SECRETS.projexa);
   const zapx = new EventSink(SECRETS.zapx);
   const [sp, pp, zp] = await Promise.all([listen(supply.server), listen(projexa.server), listen(zapx.server)]);
 
-  const db = createPool(url.toString());
+  const db = createStore(url, TEST_DB);
+  await db.mdb.dropDatabase();
   await migrate(db);
-  const cfg: Config = { ...loadConfig({ DATABASE_URL: url.toString() }), supply360Url: `http://127.0.0.1:${sp}`, supply360Secret: SECRETS.supply360, ...over };
+  const cfg: Config = { ...loadConfig({ MONGODB_URL: url }), supply360Url: `http://127.0.0.1:${sp}`, supply360Secret: SECRETS.supply360, ...over };
   const { app, supply: client } = buildApp(db, cfg);
-  await app.listen({ port: 0, host: '127.0.0.1' });
-  const base = `http://127.0.0.1:${(app.server.address() as AddressInfo).port}`;
+  const server = createServer(app);
+  const base = `http://127.0.0.1:${await listen(server)}`;
   cfg.publicUrl = base;
 
   await upsertClient(db, { id: 'projexa', system: 'PROJEXA', name: 'PROJEXA', webhookUrl: `http://127.0.0.1:${pp}/api/v1/integrations/sampleon/events`, secret: SECRETS.projexa });
@@ -161,7 +169,12 @@ export async function startHarness(over: Partial<Config> = {}): Promise<Harness>
 
   const h: Harness = {
     db, cfg, base, supply, projexa, zapx, tokens,
-    async close() { await app.close(); await db.end(); for (const s of [supply.server, projexa.server, zapx.server]) s.close(); },
+    async close() {
+      server.closeAllConnections(); server.close();
+      await db.end();
+      for (const s of [supply.server, projexa.server, zapx.server]) { s.closeAllConnections(); s.close(); }
+      if (memory) { await memory.stop(); memory = null; }
+    },
     tick: () => tick(db, cfg, client),
     async drain() { for (let i = 0; i < 5; i++) await tick(db, cfg, client); },
     signed(c, method, path, body, extra = {}) {

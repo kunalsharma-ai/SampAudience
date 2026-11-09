@@ -17,7 +17,7 @@ import { opaqueToken, partnerRedirectSignature, prefixedId, unixSeconds } from '
 import { randomBytes } from 'node:crypto';
 import { z } from 'zod';
 import type { Config } from '../config';
-import { many, one, tx, type Db, type Queryable } from '../db';
+import { count, many, one, tx, type Db, type Queryable } from '../db';
 import { actorId, badRequest, conflict, forbidden, notFound, parse, requireRole, type Actor } from '../http';
 import { inFieldwork, isActive, launchUrlFor, quotaFit, startSession, type FlowResult } from './entry';
 import { assertSee, audit, loadRequest } from './requests';
@@ -40,6 +40,9 @@ const PartnerInput = z.object({
   overquotaUrl: httpsUrl.optional(),
 }).strict();
 
+/** Stored fields that are not part of PartnerRow. */
+const HIDDEN = { _id: 0, lock_version: 0 } as const;
+
 const PID = /^[A-Za-z0-9_.:\-]{1,100}$/;
 const CLOSED_REQUEST = ['closed', 'rejected', 'cancelled'];
 
@@ -57,12 +60,13 @@ type Counts = { started: number; inProgress: number; completes: number; screenou
 const empty = (): Counts => ({ started: 0, inProgress: 0, completes: 0, screenouts: 0, overQuota: 0, qualityFails: 0, other: 0 });
 
 async function counts(q: Queryable, requestId: string) {
-  const rows = await many<{ partner_source_id: string; status: string; counted: boolean; n: string }>(q,
-    'SELECT partner_source_id, status, counted, count(*) AS n FROM sessions WHERE request_id=$1 AND partner_source_id IS NOT NULL GROUP BY 1, 2, 3', [requestId]);
+  const rows = await q.col('sessions').aggregate<{ _id: { partner_source_id: string; status: string; counted: boolean }; n: number }>([
+    { $match: { request_id: requestId, partner_source_id: { $type: 'string' } } },
+    { $group: { _id: { partner_source_id: '$partner_source_id', status: '$status', counted: '$counted' }, n: { $sum: 1 } } },
+  ], q.o).toArray();
   const out = new Map<string, Counts>();
-  for (const r of rows) {
+  for (const { _id: r, n } of rows) {
     const c = out.get(r.partner_source_id) ?? empty();
-    const n = Number(r.n);
     c.started += n;
     if (r.counted) c.completes += n;
     else if (r.status === 'started' || r.status === 'pending_verification') c.inProgress += n;
@@ -96,19 +100,21 @@ export async function addPartner(db: Db, cfg: Config, actor: Actor, requestId: s
     assertSee(actor, r);
     if (CLOSED_REQUEST.includes(r.status)) throw conflict(`The request is ${r.status}`);
     if (!r.countries.includes(b.country)) throw badRequest(`The request does not field in ${b.country}`);
-    const prior = await one<PartnerRow>(q, 'SELECT * FROM partner_sources WHERE request_id=$1 AND partner_ref=$2', [r.id, b.partnerRef]);
-    if (prior && prior.country !== b.country && (await one(q, 'SELECT 1 FROM sessions WHERE partner_source_id=$1 LIMIT 1', [prior.id]))) {
+    const prior = await one<PartnerRow>(q, 'partner_sources', { request_id: r.id, partner_ref: b.partnerRef }, { projection: HIDDEN });
+    if (prior && prior.country !== b.country && (await count(q, 'sessions', { partner_source_id: prior.id }))) {
       throw conflict('The partner already has respondents in another country');
     }
-    const row = (await one<PartnerRow>(q,
-      `INSERT INTO partner_sources (id, request_id, partner_ref, name, country, cap, entry_token, secret, complete_url, screenout_url, overquota_url, created_by)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
-       ON CONFLICT (request_id, partner_ref) DO UPDATE SET name=EXCLUDED.name, country=EXCLUDED.country, cap=EXCLUDED.cap,
-         complete_url=EXCLUDED.complete_url, screenout_url=EXCLUDED.screenout_url, overquota_url=EXCLUDED.overquota_url,
-         status='live', closed_at=NULL, updated_at=now()
-       RETURNING *`,
-      [prefixedId('pts'), r.id, b.partnerRef, b.name, b.country, b.cap, opaqueToken(), randomBytes(24).toString('base64url'),
-        b.completeUrl ?? null, b.screenoutUrl ?? null, b.overquotaUrl ?? null, actorId(actor)]))!;
+    const now = new Date();
+    const changes = {
+      name: b.name, country: b.country, cap: b.cap, complete_url: b.completeUrl ?? null, screenout_url: b.screenoutUrl ?? null, overquota_url: b.overquotaUrl ?? null,
+      status: 'live' as const, closed_at: null, updated_at: now,
+    };
+    // Same partnerRef: new cap and links; the link and secret never change.
+    const row = (await q.col('partner_sources').findOneAndUpdate(
+      { request_id: r.id, partner_ref: b.partnerRef },
+      { $set: changes, $setOnInsert: { id: prefixedId('pts'), entry_token: opaqueToken(), secret: randomBytes(24).toString('base64url'), created_by: actorId(actor), created_at: now } },
+      { upsert: true, returnDocument: 'after', projection: HIDDEN, ...q.o },
+    )) as unknown as PartnerRow;
     await audit(q, actorId(actor), prior ? 'partner.updated' : 'partner.added', r.id, { partnerRef: b.partnerRef, name: b.name, country: b.country, cap: b.cap });
     return partnerView(cfg, row, (await counts(q, r.id)).get(row.id), true);
   });
@@ -122,7 +128,8 @@ export async function listPartners(db: Db, cfg: Config, actor: Actor, requestId:
 }
 
 export async function partnersOf(q: Queryable, cfg: Config | null, requestId: string, withSecret = false) {
-  const [rows, c] = await Promise.all([many<PartnerRow>(q, 'SELECT * FROM partner_sources WHERE request_id=$1 ORDER BY created_at', [requestId]), counts(q, requestId)]);
+  const rows = await many<PartnerRow>(q, 'partner_sources', { request_id: requestId }, { projection: HIDDEN, sort: { created_at: 1, _id: 1 } });
+  const c = await counts(q, requestId);
   return rows.map((p) => partnerView(cfg, p, c.get(p.id), withSecret));
 }
 
@@ -131,7 +138,8 @@ export async function closePartner(db: Db, cfg: Config, actor: Actor, requestId:
   mayManage(actor);
   const r = await loadRequest(db, requestId);
   assertSee(actor, r);
-  const row = await one<PartnerRow>(db, "UPDATE partner_sources SET status='closed', closed_at=COALESCE(closed_at, now()), updated_at=now() WHERE request_id=$1 AND partner_ref=$2 RETURNING *", [r.id, partnerRef]);
+  const row = (await db.col('partner_sources').findOneAndUpdate({ request_id: r.id, partner_ref: partnerRef },
+    [{ $set: { status: 'closed', closed_at: { $ifNull: ['$closed_at', '$$NOW'] }, updated_at: '$$NOW' } }], { returnDocument: 'after', projection: HIDDEN })) as unknown as PartnerRow | null;
   if (!row) throw notFound('Unknown partner');
   await audit(db, actorId(actor), 'partner.closed', r.id, { partnerRef });
   return partnerView(cfg, row, (await counts(db, r.id)).get(row.id), true);
@@ -162,11 +170,11 @@ const invalid = (): FlowResult => ({ page: { title: 'Link not valid', message: '
 
 /** A partner's respondent arrives. Checks the partner is live, the cap, quotas and repeats; no SUPPLY360 profile check. */
 export async function partnerEnter(db: Db, entryToken: string, pid: string | undefined): Promise<FlowResult> {
-  const p = await one<PartnerRow>(db, 'SELECT * FROM partner_sources WHERE entry_token=$1', [entryToken]);
+  const p = await one<PartnerRow>(db, 'partner_sources', { entry_token: entryToken }, { projection: HIDDEN });
   if (!p) return invalid();
   if (!pid || !PID.test(pid) || /^\{.*\}$/.test(pid)) return { page: { title: 'Link not valid', message: 'The link is missing the respondent id (pid).', status: 400 } };
   const r = await loadRequest(db, p.request_id);
-  const prior = await one<{ status: string; token: string }>(db, 'SELECT status, token FROM sessions WHERE partner_source_id=$1 AND partner_rid=$2', [p.id, pid]);
+  const prior = await one<{ status: string; token: string }>(db, 'sessions', { partner_source_id: p.id, partner_rid: pid }, { projection: { _id: 0, status: 1, token: 1 } });
   if (prior) {
     if (prior.status === 'started' && isActive(r) && p.status === 'live') return { redirect: launchUrlFor(r, prior.token) };
     return partnerReturn(p, pid, 'duplicate');
@@ -174,13 +182,12 @@ export async function partnerEnter(db: Db, entryToken: string, pid: string | und
   if (p.status !== 'live' || !isActive(r) || !inFieldwork(r)) return partnerReturn(p, pid, 'quota_full');
   const s = await tx(db, async (q) => {
     const fresh = await loadRequest(q, r.id, true);
-    const live = await one<PartnerRow>(q, 'SELECT * FROM partner_sources WHERE id=$1 FOR UPDATE', [p.id]);
+    const live = (await q.col('partner_sources').findOneAndUpdate({ id: p.id }, { $inc: { lock_version: 1 } }, { returnDocument: 'after', projection: HIDDEN, ...q.o })) as unknown as PartnerRow | null;
     if (!live || live.status !== 'live' || !isActive(fresh)) return 'closed' as const;
-    const done = await one<{ n: string }>(q, 'SELECT count(*) AS n FROM sessions WHERE partner_source_id=$1 AND counted', [p.id]);
-    if (Number(done?.n ?? 0) >= live.cap) return 'closed' as const;
+    if ((await count(q, 'sessions', { partner_source_id: p.id, counted: true })) >= live.cap) return 'closed' as const;
     const fit = await quotaFit(q, fresh, live.country, []);
     if (fit.full.length) return 'closed' as const;
-    const again = await one(q, 'SELECT 1 FROM sessions WHERE partner_source_id=$1 AND partner_rid=$2', [p.id, pid]);
+    const again = await count(q, 'sessions', { partner_source_id: p.id, partner_rid: pid });
     if (again) return 'duplicate' as const;
     return startSession(q, fresh, {
       respondentRef: `partner:${p.id}:${pid}`, panel: 'partner', country: live.country, invitationId: null, chainId: prefixedId('chn'), hop: 0, routedFrom: null,

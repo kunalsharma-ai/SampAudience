@@ -6,32 +6,34 @@
 import { randomBytes } from 'node:crypto';
 import { hashToken, newStaffToken } from './auth';
 import { loadConfig } from './config';
-import { createPool, type Db } from './db';
+import { createStore, type Db } from './db';
 import { migrate } from './migrate';
 import { ROLES, type Role } from './http';
 
 export async function upsertClient(db: Db, c: { id: string; system: string; name: string; webhookUrl: string | null; secret?: string; outcomeSecret?: string | null }) {
   const secret = c.secret ?? randomBytes(32).toString('hex');
-  await db.query(
-    `INSERT INTO service_clients (id, system, name, secrets, webhook_url, outcome_secret) VALUES ($1,$2,$3,$4,$5,$6)
-     ON CONFLICT (id) DO UPDATE SET system=EXCLUDED.system, name=EXCLUDED.name, secrets=EXCLUDED.secrets, webhook_url=EXCLUDED.webhook_url, outcome_secret=EXCLUDED.outcome_secret, active=true`,
-    [c.id, c.system, c.name, [secret], c.webhookUrl, c.outcomeSecret ?? null]);
+  if (!['SUPPLY360', 'PROJEXA', 'ZAPX', 'EXTERNAL'].includes(c.system)) throw new Error(`Unknown system ${c.system}`);
+  await db.col('service_clients').updateOne(
+    { id: c.id },
+    { $set: { system: c.system, name: c.name, secrets: [secret], webhook_url: c.webhookUrl, outcome_secret: c.outcomeSecret ?? null, active: true }, $setOnInsert: { created_at: new Date() } },
+    { upsert: true });
   return secret;
 }
 
 export async function createUser(db: Db, u: { email: string; name: string; role: Role; organizationId?: string | null }) {
   const token = newStaffToken();
   const id = `usr_${randomBytes(8).toString('hex')}`;
-  await db.query(
-    `INSERT INTO users (id, name, email, role, organization_id, token_hash) VALUES ($1,$2,$3,$4,$5,$6)
-     ON CONFLICT (email) DO UPDATE SET name=EXCLUDED.name, role=EXCLUDED.role, organization_id=EXCLUDED.organization_id, token_hash=EXCLUDED.token_hash, active=true`,
-    [id, u.name, u.email.toLowerCase(), u.role, u.organizationId ?? null, hashToken(token)]);
+  if (!(ROLES as readonly string[]).includes(u.role)) throw new Error(`Unknown role ${u.role}`);
+  await db.col('users').updateOne(
+    { email: u.email.toLowerCase() },
+    { $set: { name: u.name, role: u.role, organization_id: u.organizationId ?? null, token_hash: hashToken(token), active: true }, $setOnInsert: { id, created_at: new Date() } },
+    { upsert: true });
   return token;
 }
 
 if (require.main === module) {
   (async () => {
-    const db = createPool(loadConfig().databaseUrl);
+    const db = createStore(loadConfig().databaseUrl);
     await migrate(db);
     const [cmd, ...a] = process.argv.slice(2);
     if (cmd === 'client' && a.length >= 4) {

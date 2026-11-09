@@ -26,7 +26,8 @@ export interface Config {
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const publicUrl = (env.PUBLIC_URL ?? `http://localhost:${env.PORT ?? 4600}`).replace(/\/+$/, '');
   return {
-    databaseUrl: env.DATABASE_URL ?? 'postgresql://sampleon:sampleon@localhost:5432/sampleon',
+    // MongoDB (a replica set: transactions need one). DATABASE_URL is still read for older setups.
+    databaseUrl: env.MONGODB_URL || env.DATABASE_URL || 'mongodb://localhost:27017/sampleon?replicaSet=rs0',
     port: num(env.PORT, 4600),
     publicUrl,
     supply360Url: env.SUPPLY360_URL ? env.SUPPLY360_URL.replace(/\/+$/, '') : null,

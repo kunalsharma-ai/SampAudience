@@ -202,9 +202,9 @@ test('routing: a screened-out respondent is offered another eligible survey once
   assert.equal(end.status, 200);
   assert.match(end.text, /no other survey/);
   // Replaying A's browser return does not route again or start a new session.
-  const sessionsBefore = (await h.db.query('SELECT count(*)::int AS n FROM sessions')).rows[0].n;
+  const sessionsBefore = await h.db.col('sessions').countDocuments();
   await h.follow(`/r/screenout?token=${encodeURIComponent(tA)}`);
-  assert.equal((await h.db.query('SELECT count(*)::int AS n FROM sessions')).rows[0].n, sessionsBefore);
+  assert.equal(await h.db.col('sessions').countDocuments(), sessionsBefore);
 
   // A respondent already invited to B is not routed to B: the chain ends instead.
   const cardA2 = cardsFor(a).find((c) => invitedToB.has(c.respondentRef));
@@ -250,8 +250,8 @@ test('hard quotas: a complete over a full cell becomes quota full; a later quali
   await h.drain();
   assert.ok(h.supply.events.some((e) => e.type === 'quality.failed' && e.correlationId === id));
   // A third woman can now enter.
-  const r = await h.db.query("SELECT status FROM rewards WHERE request_id=$1", [id]);
-  assert.deepEqual(r.rows.map((x) => x.status), ['cancelled']);
+  const r = await h.db.col<{ status: string }>('rewards').find({ request_id: id }).toArray();
+  assert.deepEqual(r.map((x) => x.status), ['cancelled']);
 });
 
 test('approved project changes from PROJEXA update targets; the requester cannot approve; closing from PROJEXA closes the request', async () => {
@@ -307,7 +307,7 @@ test('dashboard: cross-platform tiles, drill-down and role-based scope', async (
 });
 
 test('outbox: a refusing receiver is dead-lettered, shown as an integration failure, and can be replayed', async () => {
-  await h.db.query("UPDATE service_clients SET webhook_url = replace(webhook_url, '/api/v1/integrations', '/nowhere') WHERE id='zapx'");
+  await h.db.col('service_clients').updateOne({ id: 'zapx' }, [{ $set: { webhook_url: { $replaceOne: { input: '$webhook_url', find: '/api/v1/integrations', replacement: '/nowhere' } } } }]);
   h.zapx.server.removeAllListeners('request');
   h.zapx.server.on('request', (_q, res) => res.writeHead(422).end());
   await liveRequest('zapx', requestBody({ source: { platform: 'ZAPX', projectId: 'zpj_dead', surveyId: 'zsv_dead' }, countries: ['GB'], requiredCompletes: 1 }));
@@ -324,13 +324,13 @@ test('a request that only describes its audience gets draft criteria for review;
   }));
   assert.equal(described.status, 201, JSON.stringify(await described.clone().json()));
   const id = (await described.json()).audienceRequestId as string;
-  const spec = (await h.db.query('SELECT spec FROM audience_requests WHERE id=$1', [id])).rows[0].spec;
+  const spec = (await h.db.col('audience_requests').findOne({ id }))!.spec;
   assert.deepEqual([...spec.targeting.criteria].sort((a: { attribute: string }, b: { attribute: string }) => a.attribute.localeCompare(b.attribute)), [
     { attribute: 'b2b.years_experience', op: 'gte', value: 5 },
     { attribute: 'hcp.specialty', op: 'in', values: ['cardiology'] },
   ]);
   assert.equal(spec.targeting.interpretation.engine, 'rules');
-  const status = (await h.db.query('SELECT status FROM audience_requests WHERE id=$1', [id])).rows[0].status;
+  const status = (await h.db.col('audience_requests').findOne({ id }))!.status;
   assert.equal(status, 'submitted', 'nothing is sent before a person approves');
 
   const vague = await h.signed('zapx', 'POST', '/api/v1/audience-requests', requestBody({
