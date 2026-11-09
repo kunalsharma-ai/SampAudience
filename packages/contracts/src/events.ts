@@ -6,7 +6,8 @@ import { OUTCOMES } from './outcomes';
 const counts = z.object({ required: z.number().int(), completes: z.number().int(), remaining: z.number().int() });
 const countryCounts = z.record(z.string(), z.object({ target: z.number().int(), completes: z.number().int() }));
 const quotaFill = z.array(z.object({ id: z.string(), country: z.string().nullable(), target: z.number().int(), completes: z.number().int(), full: z.boolean() }));
-const sessionRef = { sessionId: z.string(), country: z.string(), quotaIds: z.array(z.string()).default([]) };
+/** partnerRef: set when the respondent came from an outside sample partner (the partner's id at SUPPLY360). */
+const sessionRef = { sessionId: z.string(), country: z.string(), quotaIds: z.array(z.string()).default([]), partnerRef: z.string().max(120).optional() };
 /** Respondent-level fields: only sent to SUPPLY360, which owns the respondent. */
 const respondent = { respondentRef: z.string().optional(), panel: z.string().optional() };
 

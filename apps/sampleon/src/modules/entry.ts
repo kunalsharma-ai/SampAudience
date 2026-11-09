@@ -11,12 +11,14 @@ import { many, one, tx, type Db, type Queryable } from '../db';
 import { HttpError } from '../http';
 import type { Supply360Client } from '../supply360';
 import { emit } from './events';
+import { partnerReturn, type PartnerRow } from './partners';
 import { emitQuotaUpdate, loadRequest, type RequestRow } from './requests';
 
 interface SessionRow {
   id: string; token: string; request_id: string; invitation_id: string | null; respondent_ref: string; panel: string; country: string;
   chain_id: string; hop: number; routed_from: string | null; quota_ids: string[]; status: string; browser_outcome: string | null;
   verified_outcome: string | null; counted: boolean; overquota: boolean; started_at: Date;
+  partner_source_id: string | null; partner_rid: string | null;
 }
 
 export type FlowResult = { redirect: string } | { page: { title: string; message: string; status: number } };
@@ -39,11 +41,11 @@ function endUrl(cfg: Config, r: RequestRow | null, status: string): FlowResult {
   return endPage('Thank you', messages[status] ?? messages.none!);
 }
 
-const isActive = (r: RequestRow) => (r.status === 'live' || (r.status === 'soft_launch' && r.completes < (r.soft_launch_target ?? Infinity)));
-const inFieldwork = (r: RequestRow, now = Date.now()) => Date.parse(r.spec.fieldwork.start) <= now && now <= Date.parse(r.spec.fieldwork.end) + 86_400_000;
+export const isActive = (r: RequestRow) => (r.status === 'live' || (r.status === 'soft_launch' && r.completes < (r.soft_launch_target ?? Infinity)));
+export const inFieldwork = (r: RequestRow, now = Date.now()) => Date.parse(r.spec.fieldwork.start) <= now && now <= Date.parse(r.spec.fieldwork.end) + 86_400_000;
 
 /** Quota cells the respondent would fill in this request, and whether any hard one is full. */
-async function quotaFit(q: Queryable, r: RequestRow, country: string, matchedQuotaIds: string[]) {
+export async function quotaFit(q: Queryable, r: RequestRow, country: string, matchedQuotaIds: string[]) {
   const cells = await many<{ quota_key: string; country: string | null; target: number; count: number; hard: boolean }>(
     q, 'SELECT quota_key, country, target, count, hard FROM quota_cells WHERE request_id=$1 AND (quota_key = $2 OR quota_key = ANY($3))',
     [r.id, `country:${country}`, matchedQuotaIds]);
@@ -64,13 +66,21 @@ async function admit(db: Db, supply: Supply360Client, r: RequestRow, respondentR
   return { ok: true as const, quotaKeys: fit.keys };
 }
 
-async function startSession(q: Queryable, r: RequestRow, p: { respondentRef: string; panel: string; country: string; invitationId: string | null; chainId: string; hop: number; routedFrom: string | null; quotaKeys: string[] }) {
+/** Who the session's events name: the panel member, or (for partner sample) the partner. */
+const whoOf = (s: { respondent_ref: string; panel: string; partner_source_id: string | null }, partnerRef: string | null) =>
+  (s.partner_source_id ? { partnerRef: partnerRef ?? undefined } : { respondentRef: s.respondent_ref, panel: s.panel });
+
+export async function startSession(q: Queryable, r: RequestRow, p: {
+  respondentRef: string; panel: string; country: string; invitationId: string | null; chainId: string; hop: number; routedFrom: string | null; quotaKeys: string[];
+  partner?: { sourceId: string; rid: string; ref: string };
+}) {
   const id = prefixedId('ses');
   const token = opaqueToken();
   await q.query(
-    'INSERT INTO sessions (id, token, request_id, invitation_id, respondent_ref, panel, country, chain_id, hop, routed_from, quota_ids) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)',
-    [id, token, r.id, p.invitationId, p.respondentRef, p.panel, p.country, p.chainId, p.hop, p.routedFrom, p.quotaKeys]);
-  await emit(q, r, 'survey.started', { sessionId: id, country: p.country, quotaIds: p.quotaKeys, respondentRef: p.respondentRef, panel: p.panel, routedFrom: p.routedFrom });
+    'INSERT INTO sessions (id, token, request_id, invitation_id, respondent_ref, panel, country, chain_id, hop, routed_from, quota_ids, partner_source_id, partner_rid) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)',
+    [id, token, r.id, p.invitationId, p.respondentRef, p.panel, p.country, p.chainId, p.hop, p.routedFrom, p.quotaKeys, p.partner?.sourceId ?? null, p.partner?.rid ?? null]);
+  const who = whoOf({ respondent_ref: p.respondentRef, panel: p.panel, partner_source_id: p.partner?.sourceId ?? null }, p.partner?.ref ?? null);
+  await emit(q, r, 'survey.started', { sessionId: id, country: p.country, quotaIds: p.quotaKeys, ...who, routedFrom: p.routedFrom });
   return { id, token };
 }
 
@@ -181,6 +191,11 @@ export async function browserReturn(db: Db, cfg: Config, supply: Supply360Client
        status = CASE WHEN verified_outcome IS NOT NULL THEN status WHEN $2 = 'complete' THEN 'pending_verification' ELSE $2 END
      WHERE id=$1 AND browser_outcome IS NULL RETURNING id`, [s.id, outcome]);
   const recorded = (s.verified_outcome ?? s.browser_outcome ?? outcome) as Outcome;
+  if (s.partner_source_id) {
+    // Partner respondents go back to their partner (never routed), with a signed status.
+    const p = (await one<PartnerRow>(db, 'SELECT * FROM partner_sources WHERE id=$1', [s.partner_source_id]))!;
+    return partnerReturn(p, s.partner_rid!, recorded);
+  }
   if (first && ROUTABLE.includes(outcome) && !s.verified_outcome) {
     const next = await route(db, cfg, supply, { chainId: s.chain_id, hop: s.hop, respondentRef: s.respondent_ref, panel: s.panel, country: s.country, fromSession: s.id, fromRequest: r, trigger: outcome as 'terminate' | 'quota_full' });
     if (next) return { redirect: next.url };
@@ -220,12 +235,15 @@ export async function verifiedOutcome(db: Db, body: { token?: unknown; status?: 
       if (s.verified_outcome === outcome) return { recorded: false, status: s.status };
       if (!(s.verified_outcome === 'complete' && outcome === 'quality_fail')) throw new HttpError(409, `A different outcome (${s.verified_outcome}) is already recorded`);
     }
-    const base = { sessionId: s.id, country: s.country, quotaIds: s.quota_ids, respondentRef: s.respondent_ref, panel: s.panel };
+    const partner = s.partner_source_id ? await one<PartnerRow>(c, 'SELECT * FROM partner_sources WHERE id=$1 FOR UPDATE', [s.partner_source_id]) : null;
+    const base = { sessionId: s.id, country: s.country, quotaIds: s.quota_ids, ...whoOf(s, partner?.partner_ref ?? null) };
 
     if (outcome === 'complete') {
       const cells = await many<{ quota_key: string; target: number; count: number; hard: boolean }>(c,
         'SELECT quota_key, target, count, hard FROM quota_cells WHERE request_id=$1 AND quota_key = ANY($2) FOR UPDATE', [r.id, s.quota_ids]);
-      if (cells.some((x) => x.hard && x.count >= x.target)) {
+      // A partner is paid for at most its cap of verified completes; the rest are over quota.
+      const partnerFull = partner ? Number((await one<{ n: string }>(c, 'SELECT count(*) AS n FROM sessions WHERE partner_source_id=$1 AND counted', [partner.id]))?.n ?? 0) >= partner.cap : false;
+      if (partnerFull || cells.some((x) => x.hard && x.count >= x.target)) {
         await c.query("UPDATE sessions SET verified_outcome='quota_full', verified_at=now(), status='quota_full', overquota=true, ended_at=COALESCE(ended_at, now()) WHERE id=$1", [s.id]);
         await emit(c, r, 'survey.screenout', { ...base, outcome: 'quota_full', routedTo: null });
         return { recorded: true, status: 'quota_full', overquota: true };
@@ -233,11 +251,14 @@ export async function verifiedOutcome(db: Db, body: { token?: unknown; status?: 
       await c.query('UPDATE quota_cells SET count = count + 1 WHERE request_id=$1 AND quota_key = ANY($2)', [r.id, s.quota_ids]);
       await c.query("UPDATE sessions SET verified_outcome='complete', verified_at=now(), status='complete', counted=true, ended_at=COALESCE(ended_at, now()) WHERE id=$1", [s.id]);
       const upd = (await one<{ completes: number }>(c, 'UPDATE audience_requests SET completes = completes + 1, updated_at=now() WHERE id=$1 RETURNING completes', [r.id]))!;
-      await c.query('INSERT INTO rewards (session_id, request_id, respondent_ref, points, value) VALUES ($1,$2,$3,$4,$5) ON CONFLICT (session_id) DO UPDATE SET status=\'pending\', updated_at=now()',
-        [s.id, r.id, s.respondent_ref, r.spec.reward.points, r.spec.reward.value ?? null]);
+      // Panel members earn the request's reward; a partner pays its own respondents.
+      if (!partner) {
+        await c.query('INSERT INTO rewards (session_id, request_id, respondent_ref, points, value) VALUES ($1,$2,$3,$4,$5) ON CONFLICT (session_id) DO UPDATE SET status=\'pending\', updated_at=now()',
+          [s.id, r.id, s.respondent_ref, r.spec.reward.points, r.spec.reward.value ?? null]);
+      }
       const loi = Math.round(((Date.now() - new Date(s.started_at).getTime()) / 60_000) * 10) / 10;
       const ev = await emit(c, r, 'survey.completed', {
-        ...base, loiMinutes: loi, rewardPoints: r.spec.reward.points, verified: true,
+        ...base, loiMinutes: loi, rewardPoints: partner ? 0 : r.spec.reward.points, verified: true,
         progress: { required: r.required_completes, completes: upd.completes, remaining: Math.max(0, r.required_completes - upd.completes) },
       });
       for (const cell of await many<{ quota_key: string; country: string | null; target: number }>(c,

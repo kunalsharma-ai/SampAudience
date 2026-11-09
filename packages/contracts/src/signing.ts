@@ -71,3 +71,10 @@ export function verifyRequest(opts: {
 
 /** Survey host → SAMPLEON outcome confirmation: hex HMAC(hostSecret, token.status.timestamp). */
 export const outcomeSignature = (hostSecret: string, token: string, status: string, timestamp: number) => hmacHex(hostSecret, `${token}.${status}.${timestamp}`);
+
+/**
+ * SAMPLEON → sample partner redirect: hex HMAC(partnerSecret, pid.status.timestamp), sent as `sig`
+ * with `pid`, `status` and `ts` on the partner's own complete, screen-out and over-quota links, so
+ * the partner can tell a real return from a respondent typing the link.
+ */
+export const partnerRedirectSignature = (partnerSecret: string, pid: string, status: string, timestamp: number) => hmacHex(partnerSecret, `${pid}.${status}.${timestamp}`);

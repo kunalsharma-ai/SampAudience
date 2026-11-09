@@ -225,6 +225,47 @@ ZAPX implements this as the `SAMPLEON` vendor integration (same adapter as PROJE
 returned to `/r/{status}`, and the signed S2S outcome goes through ZAPX's callback outbox with
 retries.
 
+### 5.5 Outside sample partners (entry links and verified partner completes)
+
+When SUPPLY360's own panels cannot fill a request, SUPPLY360 buys sample from an outside partner
+(a *partner fill*). SAMPLEON gives each partner its own entry link and counts the partner's
+completes from the survey host's verified outcome, so nobody has to trust the partner's own
+count. Migration `002_partner_sources.sql`, module `src/modules/partners.ts`.
+
+- **Add a partner.** `POST /api/v1/audience-requests/{id}/partners` (SUPPLY360's signed client, or
+  a supply admin or manager) with `{ partnerRef, name, country, cap, completeUrl?, screenoutUrl?,
+  overquotaUrl? }`. `partnerRef` is the partner fill at SUPPLY360; `cap` is how many verified
+  completes the partner is paid for; links are the partner's own (https). The answer has
+  `entryUrl = {SAMPLEON}/p/{entryToken}?pid={RID}` and the partner's `secret`. Sending the same
+  `partnerRef` again changes the cap and links; the link and secret stay the same. The country
+  must be one of the request's.
+- **Entry.** The partner sends each respondent to the entry link with its own respondent id in
+  `pid` (1–100 letters, digits, `_ . : -`). SAMPLEON checks that the partner and the request are
+  live and in fieldwork, the partner's cap and the country's quota, and that the `pid` has not
+  been used. Then it starts a session and redirects to the survey's `launchUrl` as for a panel
+  member. Partner respondents are **not** checked against SUPPLY360 profiles, are **never
+  routed** to another survey, and earn **no panel reward** (the partner pays them).
+- **Return to the partner.** At the browser return the respondent goes back to the partner's link
+  for the outcome (`complete`; `quota_full` to the over-quota link; anything else, including a
+  repeat `pid` as `duplicate`, to the screen-out link). `{pid}` or `[pid]` in the link is filled
+  in, otherwise `pid` is added, together with `status`, `ts` and
+  `sig = hex HMAC-SHA256(secret, pid + "." + status + "." + ts)`, so the partner can tell a real
+  return from a typed link. A closed partner, a full cap or a closed request sends new
+  respondents to the over-quota link.
+- **Counting.** A partner complete counts only when the survey host verifies it (§5.3). Verified
+  completes beyond the cap are recorded as `quota_full` (over quota). A later `quality_fail`
+  takes the complete off the partner's count. Partner completes count toward the request's total
+  and quotas like any other.
+- **Events.** `survey.started`, `survey.completed`, `survey.screenout` and `quality.failed` for a
+  partner session carry `partnerRef` (and no `respondentRef`), with `rewardPoints: 0`. SUPPLY360
+  uses them to pay the partner on verified completes.
+- **Read and close.** `GET /api/v1/audience-requests/{id}/partners` lists each partner with its
+  counts (started, in progress, completes, screen-outs, over quota, quality fails) and what is
+  left of the cap; the secret only for SUPPLY360, supply admins and managers.
+  `POST …/partners/{partnerRef}/close` stops new entries; respondents already in the survey can
+  finish. The request view shows partners and their counts to SUPPLY360 and staff, never to the
+  source platform or client viewers.
+
 ### 5.4 Callers' webhook receivers
 
 PROJEXA (`POST /api/v1/integrations/sampleon/events`) and ZAPX (`POST /api/v1/sampleon/events`)
