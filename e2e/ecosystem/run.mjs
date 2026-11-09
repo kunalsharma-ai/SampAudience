@@ -10,9 +10,11 @@
  * over HTTP exactly as the products and a respondent's browser would, checks every system's
  * records, and stops the services. Nothing is mocked.
  *
- * Needs: built checkouts of the four repositories and a PostgreSQL superuser.
+ * Needs: built checkouts of the four repositories, a PostgreSQL superuser (SUPPLY360, ZAPX,
+ * PROJEXA) and a MongoDB replica set (SAMPLEON).
  *   SUPPLY360_DIR=../Sampledge-full-Supply-CRM ZAPX_DIR=../Sampledge-ZAPX PROJEXA_DIR=../Projecxa \
- *   PG_ADMIN_URL=postgresql://postgres:postgres@localhost:5432/postgres node e2e/ecosystem/run.mjs
+ *   PG_ADMIN_URL=postgresql://postgres:postgres@localhost:5432/postgres \
+ *   MONGO_E2E_URL='mongodb://localhost:27017/?replicaSet=rs0' node e2e/ecosystem/run.mjs
  * See e2e/ecosystem/README.md.
  */
 import { spawn, execFileSync } from 'node:child_process';
@@ -23,6 +25,7 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import assert from 'node:assert/strict';
 import pg from 'pg';
+import { MongoClient } from 'mongodb';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const root = resolve(here, '../..');
@@ -31,6 +34,7 @@ const SUPPLY360_DIR = dir('SUPPLY360_DIR', join(root, '../sampledge-full-supply-
 const ZAPX_DIR = dir('ZAPX_DIR', join(root, '../sampledge-zapx'));
 const PROJEXA_DIR = dir('PROJEXA_DIR', join(root, '../projecxa'));
 const PG_ADMIN_URL = process.env.PG_ADMIN_URL ?? 'postgresql://postgres:postgres@localhost:5432/postgres';
+const MONGO_E2E_URL = process.env.MONGO_E2E_URL ?? 'mongodb://localhost:27017/?replicaSet=rs0';
 const LOGS = resolve(process.env.E2E_LOG_DIR ?? join(root, 'e2e/ecosystem/logs'));
 mkdirSync(LOGS, { recursive: true });
 
@@ -38,6 +42,8 @@ const PORT = { sampleon: 4600, supply360: 4610, zapx: 4620, projexa: 4630 };
 const url = (s) => `http://127.0.0.1:${PORT[s]}`;
 const dbUrl = (name) => { const u = new URL(PG_ADMIN_URL); u.pathname = `/${name}`; return u.toString(); };
 const DB = { sampleon: 'sampleon_e2e', supply360: 'supply360_e2e', zapx: 'zapx_e2e', projexa: 'projexa_e2e' };
+/** SAMPLEON's database is MongoDB: the same server URL with the database name as its path. */
+const mongoDbUrl = (name) => { const u = new URL(MONGO_E2E_URL); u.pathname = `/${name}`; return u.toString(); };
 
 // One secret per pair of systems (docs/ECOSYSTEM_ARCHITECTURE.md §5.0).
 const SECRET = {
@@ -129,11 +135,14 @@ async function setUp() {
   step('Databases');
   const admin = new pg.Client({ connectionString: PG_ADMIN_URL });
   await admin.connect();
-  for (const name of Object.values(DB)) {
+  for (const name of [DB.supply360, DB.zapx, DB.projexa]) {
     await admin.query(`DROP DATABASE IF EXISTS ${name} WITH (FORCE)`);
     await admin.query(`CREATE DATABASE ${name}`);
   }
   await admin.end();
+  const mongo = new MongoClient(MONGO_E2E_URL);
+  await mongo.db(DB.sampleon).dropDatabase();
+  await mongo.close();
   ok(Object.values(DB).join(', '));
 
   step('Migrations and seed data');
@@ -164,7 +173,7 @@ async function setUp() {
   ok('PROJEXA migrated, organization and admin created');
 
   const adminJs = join(root, 'apps/sampleon/dist/src/admin.js');
-  const env = { DATABASE_URL: dbUrl(DB.sampleon) };
+  const env = { MONGODB_URL: mongoDbUrl(DB.sampleon) };
   run('node', [adminJs, 'client', 'supply360', 'SUPPLY360', 'SUPPLY360', `${url('supply360')}/api/v1/s2s/supply/events`, SECRET.supply360], { env });
   run('node', [adminJs, 'client', 'projexa', 'PROJEXA', 'PROJEXA', `${url('projexa')}/api/v1/integrations/sampleon/events`, SECRET.projexa], { env });
   run('node', [adminJs, 'client', 'zapx', 'ZAPX', 'ZAPX', `${url('zapx')}/api/v1/sampleon/events`, SECRET.zapx, SECRET.zapxOutcome], { env });
@@ -177,7 +186,7 @@ async function setUp() {
 
   step('Starting the four services');
   start('sampleon', 'node', ['apps/sampleon/dist/src/main.js'], root, {
-    DATABASE_URL: dbUrl(DB.sampleon), PORT: String(PORT.sampleon), HOST: '127.0.0.1', PUBLIC_URL: url('sampleon'),
+    MONGODB_URL: mongoDbUrl(DB.sampleon), PORT: String(PORT.sampleon), HOST: '127.0.0.1', PUBLIC_URL: url('sampleon'),
     SUPPLY360_URL: url('supply360'), SUPPLY360_SECRET: SECRET.supply360, WORKER_INTERVAL_MS: '300', AI_PROVIDER: 'rules',
   });
   start('supply360', 'node', ['dist/main.js'], join(SUPPLY360_DIR, 'apps/api'), {
@@ -289,8 +298,8 @@ async function main() {
   const staff = await setUp();
   const supplyDb = new pg.Client({ connectionString: dbUrl(DB.supply360) });
   await supplyDb.connect();
-  const sampleonDb = new pg.Client({ connectionString: dbUrl(DB.sampleon) });
-  await sampleonDb.connect();
+  const sampleonMongo = new MongoClient(MONGO_E2E_URL);
+  const sampleonDb = sampleonMongo.db(DB.sampleon);
   const zapx = await zapxSignup();
 
   // ===== Workflow 1 ==============================================================================
@@ -331,9 +340,9 @@ async function main() {
   const part1 = await until('SUPPLY360 participation and reward', async () => (await supplyDb.query(`SELECT status, "rewardEntryId" FROM "Participation" WHERE "audienceRequestId"=$1 AND "panelistId"=$2`, [ar1, r1.panelistId])).rows.find((p) => p.status === 'complete' && p.rewardEntryId) ?? null);
   const entry = (await supplyDb.query(`SELECT points, kind FROM "IncentiveEntry" WHERE id=$1`, [part1.rewardEntryId])).rows[0];
   ok(`SUPPLY360 recorded the participation and posted ${entry.points} reward points`);
-  await until('SAMPLEON to receive the reward confirmation', async () => (await sampleonDb.query(`SELECT 1 FROM inbox WHERE type='reward.eligibility_confirmed' AND correlation_id=$1`, [ar1])).rowCount > 0);
+  await until('SAMPLEON to receive the reward confirmation', async () => (await sampleonDb.collection('inbox').countDocuments({ type: 'reward.eligibility_confirmed', correlation_id: ar1 })) > 0);
   ok('SUPPLY360 confirmed reward eligibility back to SAMPLEON');
-  const pxEvents = (await sampleonDb.query(`SELECT type, status FROM outbox WHERE correlation_id=$1 AND destination='projexa' ORDER BY id`, [ar1])).rows;
+  const pxEvents = await sampleonDb.collection('outbox').find({ correlation_id: ar1, destination: 'projexa' }, { projection: { _id: 0, type: 1, status: 1 }, sort: { id: 1 } }).toArray();
   assert.ok(pxEvents.every((e) => e.status === 'delivered'), JSON.stringify(pxEvents));
   ok(`events to PROJEXA, all delivered: ${[...new Set(pxEvents.map((e) => e.type))].join(', ')}`);
 
@@ -366,17 +375,17 @@ async function main() {
   ok(`ZAPX shows ${zrow.completes}/${zrow.requiredCompletes} completes, status ${zrow.status} (SAMPLEON closed it at target)`);
   const pxView = expectOk(await px('GET', `/projects/${project.id}/sampleon`), 'PROJEXA view');
   assert.ok(!pxView.requests.some((x) => x.audienceRequestId === ar2), 'PROJEXA is not involved in workflow 2');
-  assert.equal((await sampleonDb.query(`SELECT count(*)::int AS n FROM outbox WHERE correlation_id=$1 AND destination='projexa'`, [ar2])).rows[0].n, 0);
+  assert.equal(await sampleonDb.collection('outbox').countDocuments({ correlation_id: ar2, destination: 'projexa' }), 0);
   ok('no PROJEXA project, record or event for the independent survey');
 
   step('Dashboard');
   const dash = expectOk(await sampleon(staff.manager)('GET', '/api/v1/dashboard/summary'), 'dashboard');
   ok(`SAMPLEON dashboard: ${JSON.stringify(dash.tiles ?? dash).slice(0, 300)}`);
-  const dead = (await sampleonDb.query(`SELECT count(*)::int AS n FROM outbox WHERE status='dead'`)).rows[0].n;
+  const dead = await sampleonDb.collection('outbox').countDocuments({ status: 'dead' });
   assert.equal(dead, 0, 'no undeliverable events');
   ok('no dead-lettered events');
 
-  await supplyDb.end(); await sampleonDb.end();
+  await supplyDb.end(); await sampleonMongo.close();
   console.log('\nBoth workflows passed end to end.');
 }
 

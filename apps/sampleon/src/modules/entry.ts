@@ -7,12 +7,12 @@
  */
 import { outcomeSignature, opaqueToken, parseOutcome, prefixedId, ROUTABLE, safeEqualHex, unixSeconds, type Outcome } from '@sampledge/contracts';
 import type { Config } from '../config';
-import { many, one, tx, type Db, type Queryable } from '../db';
+import { count, many, one, tx, type Db, type Queryable } from '../db';
 import { HttpError } from '../http';
 import type { Supply360Client } from '../supply360';
 import { emit } from './events';
 import { partnerReturn, type PartnerRow } from './partners';
-import { emitQuotaUpdate, loadRequest, type RequestRow } from './requests';
+import { emitQuotaUpdate, loadRequest, updateRequest, type RequestRow } from './requests';
 
 interface SessionRow {
   id: string; token: string; request_id: string; invitation_id: string | null; respondent_ref: string; panel: string; country: string;
@@ -47,8 +47,7 @@ export const inFieldwork = (r: RequestRow, now = Date.now()) => Date.parse(r.spe
 /** Quota cells the respondent would fill in this request, and whether any hard one is full. */
 export async function quotaFit(q: Queryable, r: RequestRow, country: string, matchedQuotaIds: string[]) {
   const cells = await many<{ quota_key: string; country: string | null; target: number; count: number; hard: boolean }>(
-    q, 'SELECT quota_key, country, target, count, hard FROM quota_cells WHERE request_id=$1 AND (quota_key = $2 OR quota_key = ANY($3))',
-    [r.id, `country:${country}`, matchedQuotaIds]);
+    q, 'quota_cells', { request_id: r.id, quota_key: { $in: [`country:${country}`, ...matchedQuotaIds] } }, { sort: { id: 1 } });
   const relevant = cells.filter((c) => c.country === null || c.country === country);
   const full = relevant.filter((c) => c.hard && c.count >= c.target).map((c) => c.quota_key);
   return { keys: relevant.map((c) => c.quota_key), full };
@@ -76,9 +75,11 @@ export async function startSession(q: Queryable, r: RequestRow, p: {
 }) {
   const id = prefixedId('ses');
   const token = opaqueToken();
-  await q.query(
-    'INSERT INTO sessions (id, token, request_id, invitation_id, respondent_ref, panel, country, chain_id, hop, routed_from, quota_ids, partner_source_id, partner_rid) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)',
-    [id, token, r.id, p.invitationId, p.respondentRef, p.panel, p.country, p.chainId, p.hop, p.routedFrom, p.quotaKeys, p.partner?.sourceId ?? null, p.partner?.rid ?? null]);
+  await q.col('sessions').insertOne({
+    id, token, request_id: r.id, invitation_id: p.invitationId, respondent_ref: p.respondentRef, panel: p.panel, country: p.country, chain_id: p.chainId,
+    hop: p.hop, routed_from: p.routedFrom, quota_ids: p.quotaKeys, status: 'started', browser_outcome: null, verified_outcome: null, verified_at: null,
+    counted: false, overquota: false, started_at: new Date(), ended_at: null, partner_source_id: p.partner?.sourceId ?? null, partner_rid: p.partner?.rid ?? null,
+  }, q.o);
   const who = whoOf({ respondent_ref: p.respondentRef, panel: p.panel, partner_source_id: p.partner?.sourceId ?? null }, p.partner?.ref ?? null);
   await emit(q, r, 'survey.started', { sessionId: id, country: p.country, quotaIds: p.quotaKeys, ...who, routedFrom: p.routedFrom });
   return { id, token };
@@ -99,21 +100,25 @@ export interface RouteFrom {
 export async function route(db: Db, cfg: Config, supply: Supply360Client, from: RouteFrom): Promise<{ requestId: string; url: string } | null> {
   const reasons: Record<string, string> = {};
   const record = async (toRequest: string | null, toSession: string | null, considered: number) => {
-    await db.query('INSERT INTO routing_decisions (chain_id, from_session, from_request, to_request, to_session, trigger, considered, reasons) VALUES ($1,$2,$3,$4,$5,$6,$7,$8)',
-      [from.chainId, from.fromSession, from.fromRequest.id, toRequest, toSession, from.trigger, considered, JSON.stringify(reasons)]);
+    await db.col('routing_decisions').insertOne({
+      id: await db.nextId('routing_decisions'), chain_id: from.chainId, from_session: from.fromSession, from_request: from.fromRequest.id,
+      to_request: toRequest, to_session: toSession, trigger: from.trigger, considered, reasons: { ...reasons }, created_at: new Date(),
+    });
   };
   if (from.fromRequest.spec.redirects.allowRouting === false) { reasons._ = 'source request does not allow routing'; await record(null, null, 0); return null; }
   if (from.hop + 1 > cfg.maxRouteHops) { reasons._ = `hop limit ${cfg.maxRouteHops} reached`; await record(null, null, 0); return null; }
 
-  const seenSurveys = new Set((await many<{ survey_id: string }>(db,
-    `SELECT DISTINCT r.survey_id FROM audience_requests r WHERE r.id IN (
-       SELECT request_id FROM sessions WHERE respondent_ref=$1 UNION SELECT request_id FROM invitations WHERE respondent_ref=$1 AND status <> 'suppressed')`,
-    [from.respondentRef])).map((x) => x.survey_id));
-  const chainRequests = new Set((await many<{ request_id: string }>(db, 'SELECT request_id FROM sessions WHERE chain_id=$1', [from.chainId])).map((x) => x.request_id));
+  const takenRequests = [
+    ...await db.col('sessions').distinct('request_id', { respondent_ref: from.respondentRef }),
+    ...await db.col('invitations').distinct('request_id', { respondent_ref: from.respondentRef, status: { $ne: 'suppressed' } }),
+  ];
+  const seenSurveys = new Set<string>(await db.col('audience_requests').distinct('survey_id', { id: { $in: takenRequests } }));
+  const chainRequests = new Set<string>(await db.col('sessions').distinct('request_id', { chain_id: from.chainId }));
+  const activeHosts = await db.col('service_clients').distinct('id', { active: true });
 
-  const candidates = (await many<RequestRow>(db,
-    `SELECT r.* FROM audience_requests r JOIN service_clients h ON h.id = r.host_client_id AND h.active
-     WHERE r.status IN ('soft_launch','live') AND $1 = ANY(r.countries) AND r.id <> $2`, [from.country, from.fromRequest.id]))
+  const candidates = (await many<RequestRow>(db, 'audience_requests',
+    { status: { $in: ['soft_launch', 'live'] }, countries: from.country, id: { $ne: from.fromRequest.id }, host_client_id: { $in: activeHosts } },
+    { projection: { _id: 0, open: 0, lock_version: 0 }, sort: { _id: 1 } }))
     .filter((r) => {
       if (r.spec.redirects.allowRouting === false) { reasons[r.id] = 'does not accept routed respondents'; return false; }
       if (!isActive(r)) { reasons[r.id] = 'soft launch target reached'; return false; }
@@ -149,17 +154,17 @@ export async function route(db: Db, cfg: Config, supply: Supply360Client, from: 
 // ---- Entry ----------------------------------------------------------------------------------
 
 export async function enter(db: Db, cfg: Config, supply: Supply360Client, invitationToken: string): Promise<FlowResult> {
-  const inv = await one<{ id: string; request_id: string; respondent_ref: string; panel: string; country: string; status: string }>(
-    db, 'SELECT id, request_id, respondent_ref, panel, country, status FROM invitations WHERE token=$1', [invitationToken]);
+  const inv = await one<{ id: string; request_id: string; respondent_ref: string; panel: string; country: string; status: string; opened_at: Date | null }>(
+    db, 'invitations', { token: invitationToken });
   if (!inv || inv.status === 'withdrawn' || inv.status === 'suppressed') return endPage('Link not valid', 'This survey link is not valid any more.', 404);
   const r = await loadRequest(db, inv.request_id);
 
-  const existing = await one<SessionRow>(db, 'SELECT * FROM sessions WHERE request_id=$1 AND respondent_ref=$2 ORDER BY started_at DESC LIMIT 1', [r.id, inv.respondent_ref]);
+  const existing = await one<SessionRow>(db, 'sessions', { request_id: r.id, respondent_ref: inv.respondent_ref }, { sort: { started_at: -1, _id: -1 } });
   if (existing) {
     if (existing.status === 'started' && isActive(r)) return { redirect: launchUrlFor(r, existing.token) };
     return endPage('Already taken', 'You have already taken part in this survey. Thank you!');
   }
-  await db.query("UPDATE invitations SET status='opened', opened_at=COALESCE(opened_at, now()) WHERE id=$1", [inv.id]);
+  await db.col('invitations').updateOne({ id: inv.id }, [{ $set: { status: 'opened', opened_at: { $ifNull: ['$opened_at', '$$NOW'] } } }]);
 
   const chainId = prefixedId('chn');
   const placeholder = `entry:${inv.id}`;
@@ -183,17 +188,19 @@ export async function enter(db: Db, cfg: Config, supply: Supply360Client, invita
 
 export async function browserReturn(db: Db, cfg: Config, supply: Supply360Client, slug: string, token: string | undefined): Promise<FlowResult> {
   const outcome = parseOutcome(slug);
-  const s = token ? await one<SessionRow>(db, 'SELECT * FROM sessions WHERE token=$1', [token]) : null;
+  const s = token ? await one<SessionRow>(db, 'sessions', { token }) : null;
   if (!s || !outcome) return endPage('Thank you', 'Thank you for your time.');
   const r = await loadRequest(db, s.request_id);
-  const first = await one<{ id: string }>(db,
-    `UPDATE sessions SET browser_outcome=$2, ended_at=COALESCE(ended_at, now()),
-       status = CASE WHEN verified_outcome IS NOT NULL THEN status WHEN $2 = 'complete' THEN 'pending_verification' ELSE $2 END
-     WHERE id=$1 AND browser_outcome IS NULL RETURNING id`, [s.id, outcome]);
+  // Only the first browser return is recorded (a matched update means this is the first).
+  const first = (await db.col('sessions').updateOne({ id: s.id, browser_outcome: null }, [{ $set: {
+    browser_outcome: { $literal: outcome },
+    ended_at: { $ifNull: ['$ended_at', '$$NOW'] },
+    status: { $cond: [{ $ne: [{ $ifNull: ['$verified_outcome', null] }, null] }, '$status', { $literal: outcome === 'complete' ? 'pending_verification' : outcome }] },
+  } }])).modifiedCount === 1;
   const recorded = (s.verified_outcome ?? s.browser_outcome ?? outcome) as Outcome;
   if (s.partner_source_id) {
     // Partner respondents go back to their partner (never routed), with a signed status.
-    const p = (await one<PartnerRow>(db, 'SELECT * FROM partner_sources WHERE id=$1', [s.partner_source_id]))!;
+    const p = (await one<PartnerRow>(db, 'partner_sources', { id: s.partner_source_id }))!;
     return partnerReturn(p, s.partner_rid!, recorded);
   }
   if (first && ROUTABLE.includes(outcome) && !s.verified_outcome) {
@@ -203,9 +210,9 @@ export async function browserReturn(db: Db, cfg: Config, supply: Supply360Client
   }
   if (!first) {
     // A repeat of the browser return: send them to where the first one went, without routing again.
-    const prior = await one<{ to_session: string | null }>(db, 'SELECT to_session FROM routing_decisions WHERE from_session=$1 ORDER BY id DESC LIMIT 1', [s.id]);
+    const prior = await one<{ to_session: string | null }>(db, 'routing_decisions', { from_session: s.id }, { projection: { _id: 0, to_session: 1 }, sort: { id: -1 } });
     if (prior?.to_session) {
-      const next = await one<{ token: string; request_id: string; status: string }>(db, 'SELECT token, request_id, status FROM sessions WHERE id=$1', [prior.to_session]);
+      const next = await one<{ token: string; request_id: string; status: string }>(db, 'sessions', { id: prior.to_session }, { projection: { _id: 0, token: 1, request_id: 1, status: 1 } });
       if (next && next.status === 'started') return { redirect: launchUrlFor(await loadRequest(db, next.request_id), next.token) };
     }
   }
@@ -214,6 +221,14 @@ export async function browserReturn(db: Db, cfg: Config, supply: Supply360Client
 
 // ---- Verified outcome (server to server) ----------------------------------------------------
 
+/** Record the verified outcome on a session; ended_at keeps the first end time. */
+async function endSession(q: Queryable, id: string, set: Record<string, unknown>) {
+  await q.col('sessions').updateOne({ id }, [{ $set: {
+    ...Object.fromEntries(Object.entries(set).map(([k, v]) => [k, { $literal: v }])),
+    verified_at: '$$NOW', ended_at: { $ifNull: ['$ended_at', '$$NOW'] },
+  } }], q.o);
+}
+
 export async function verifiedOutcome(db: Db, body: { token?: unknown; status?: unknown; timestamp?: unknown; signature?: unknown }, nowMs = Date.now()) {
   const token = typeof body.token === 'string' ? body.token : '';
   const slug = typeof body.status === 'string' ? body.status : '';
@@ -221,54 +236,63 @@ export async function verifiedOutcome(db: Db, body: { token?: unknown; status?: 
   const signature = typeof body.signature === 'string' ? body.signature : '';
   const outcome = parseOutcome(slug);
   if (!token || !outcome || !Number.isInteger(ts)) throw new HttpError(400, 'token, status and timestamp are required');
-  const found = await one<SessionRow & { outcome_secret: string | null }>(db,
-    'SELECT s.*, h.outcome_secret FROM sessions s JOIN audience_requests r ON r.id=s.request_id JOIN service_clients h ON h.id=r.host_client_id WHERE s.token=$1', [token]);
-  if (!found) throw new HttpError(404, 'Unknown token');
+  const session = await one<SessionRow>(db, 'sessions', { token });
+  const req = session ? await one<{ host_client_id: string }>(db, 'audience_requests', { id: session.request_id }, { projection: { _id: 0, host_client_id: 1 } }) : null;
+  const host = req ? await one<{ outcome_secret: string | null }>(db, 'service_clients', { id: req.host_client_id }, { projection: { _id: 0, outcome_secret: 1 } }) : null;
+  if (!session || !host) throw new HttpError(404, 'Unknown token');
+  const found = { ...session, outcome_secret: host.outcome_secret };
   if (!found.outcome_secret || Math.abs(unixSeconds(nowMs) - ts) > 300 || !safeEqualHex(outcomeSignature(found.outcome_secret, token, slug, ts), signature)) {
     throw new HttpError(401, 'Bad signature or timestamp');
   }
 
   return tx(db, async (c) => {
-    const s = (await one<SessionRow>(c, 'SELECT * FROM sessions WHERE id=$1 FOR UPDATE', [found.id]))!;
+    // Writing the session first locks it: a second outcome for it waits and re-runs after this one.
+    const s = (await c.col('sessions').findOneAndUpdate({ id: found.id }, { $inc: { lock_version: 1 } }, { projection: { _id: 0, lock_version: 0 }, returnDocument: 'after', ...c.o })) as unknown as SessionRow;
     const r = await loadRequest(c, s.request_id, true);
     if (s.verified_outcome) {
       if (s.verified_outcome === outcome) return { recorded: false, status: s.status };
       if (!(s.verified_outcome === 'complete' && outcome === 'quality_fail')) throw new HttpError(409, `A different outcome (${s.verified_outcome}) is already recorded`);
     }
-    const partner = s.partner_source_id ? await one<PartnerRow>(c, 'SELECT * FROM partner_sources WHERE id=$1 FOR UPDATE', [s.partner_source_id]) : null;
+    const partner = s.partner_source_id
+      ? (await c.col('partner_sources').findOneAndUpdate({ id: s.partner_source_id }, { $inc: { lock_version: 1 } }, { projection: { _id: 0, lock_version: 0 }, returnDocument: 'after', ...c.o })) as unknown as PartnerRow | null
+      : null;
     const base = { sessionId: s.id, country: s.country, quotaIds: s.quota_ids, ...whoOf(s, partner?.partner_ref ?? null) };
 
     if (outcome === 'complete') {
-      const cells = await many<{ quota_key: string; target: number; count: number; hard: boolean }>(c,
-        'SELECT quota_key, target, count, hard FROM quota_cells WHERE request_id=$1 AND quota_key = ANY($2) FOR UPDATE', [r.id, s.quota_ids]);
+      // The request is locked, so these counts cannot change under us.
+      const cells = await many<{ quota_key: string; target: number; count: number; hard: boolean }>(c, 'quota_cells', { request_id: r.id, quota_key: { $in: s.quota_ids } });
       // A partner is paid for at most its cap of verified completes; the rest are over quota.
-      const partnerFull = partner ? Number((await one<{ n: string }>(c, 'SELECT count(*) AS n FROM sessions WHERE partner_source_id=$1 AND counted', [partner.id]))?.n ?? 0) >= partner.cap : false;
+      const partnerFull = partner ? (await count(c, 'sessions', { partner_source_id: partner.id, counted: true })) >= partner.cap : false;
       if (partnerFull || cells.some((x) => x.hard && x.count >= x.target)) {
-        await c.query("UPDATE sessions SET verified_outcome='quota_full', verified_at=now(), status='quota_full', overquota=true, ended_at=COALESCE(ended_at, now()) WHERE id=$1", [s.id]);
+        await endSession(c, s.id, { verified_outcome: 'quota_full', status: 'quota_full', overquota: true });
         await emit(c, r, 'survey.screenout', { ...base, outcome: 'quota_full', routedTo: null });
         return { recorded: true, status: 'quota_full', overquota: true };
       }
-      await c.query('UPDATE quota_cells SET count = count + 1 WHERE request_id=$1 AND quota_key = ANY($2)', [r.id, s.quota_ids]);
-      await c.query("UPDATE sessions SET verified_outcome='complete', verified_at=now(), status='complete', counted=true, ended_at=COALESCE(ended_at, now()) WHERE id=$1", [s.id]);
-      const upd = (await one<{ completes: number }>(c, 'UPDATE audience_requests SET completes = completes + 1, updated_at=now() WHERE id=$1 RETURNING completes', [r.id]))!;
+      await c.col('quota_cells').updateMany({ request_id: r.id, quota_key: { $in: s.quota_ids } }, { $inc: { count: 1 } }, c.o);
+      await endSession(c, s.id, { verified_outcome: 'complete', status: 'complete', counted: true });
+      const upd = (await updateRequest(c, r.id, {}, { inc: { completes: 1 } }))!;
       // Panel members earn the request's reward; a partner pays its own respondents.
       if (!partner) {
-        await c.query('INSERT INTO rewards (session_id, request_id, respondent_ref, points, value) VALUES ($1,$2,$3,$4,$5) ON CONFLICT (session_id) DO UPDATE SET status=\'pending\', updated_at=now()',
-          [s.id, r.id, s.respondent_ref, r.spec.reward.points, r.spec.reward.value ?? null]);
+        await c.col('rewards').updateOne({ session_id: s.id }, {
+          $set: { status: 'pending', updated_at: new Date() },
+          $setOnInsert: { request_id: r.id, respondent_ref: s.respondent_ref, points: r.spec.reward.points, value: r.spec.reward.value ?? null, ledger_entry_id: null },
+        }, { upsert: true, ...c.o });
       }
       const loi = Math.round(((Date.now() - new Date(s.started_at).getTime()) / 60_000) * 10) / 10;
       const ev = await emit(c, r, 'survey.completed', {
         ...base, loiMinutes: loi, rewardPoints: partner ? 0 : r.spec.reward.points, verified: true,
         progress: { required: r.required_completes, completes: upd.completes, remaining: Math.max(0, r.required_completes - upd.completes) },
       });
-      for (const cell of await many<{ quota_key: string; country: string | null; target: number }>(c,
-        'UPDATE quota_cells SET full_announced=true WHERE request_id=$1 AND quota_key = ANY($2) AND count >= target AND NOT full_announced RETURNING quota_key, country, target', [r.id, s.quota_ids])) {
+      const nowFull = await many<{ id: number; quota_key: string; country: string | null; target: number }>(c, 'quota_cells',
+        { request_id: r.id, quota_key: { $in: s.quota_ids }, full_announced: false, $expr: { $gte: ['$count', '$target'] } }, { sort: { id: 1 } });
+      if (nowFull.length) await c.col('quota_cells').updateMany({ id: { $in: nowFull.map((x) => x.id) } }, { $set: { full_announced: true } }, c.o);
+      for (const cell of nowFull) {
         await emit(c, r, 'quota.full', { quotaId: cell.quota_key, country: cell.country, target: cell.target }, ev.eventId);
       }
       await emitQuotaUpdate(c, r, ev.eventId);
       if (upd.completes >= r.required_completes && r.status !== 'closed') {
-        await c.query("UPDATE audience_requests SET status='closed', updated_at=now() WHERE id=$1", [r.id]);
-        await c.query("UPDATE batches SET status='cancelled' WHERE request_id=$1 AND status='scheduled'", [r.id]);
+        await updateRequest(c, r.id, { status: 'closed' });
+        await c.col('batches').updateMany({ request_id: r.id, status: 'scheduled' }, { $set: { status: 'cancelled' } }, c.o);
         await emit(c, r, 'project.closed', { reason: 'target reached', progress: { required: r.required_completes, completes: upd.completes, remaining: 0 } }, ev.eventId);
       }
       return { recorded: true, status: 'complete' };
@@ -276,19 +300,21 @@ export async function verifiedOutcome(db: Db, body: { token?: unknown; status?: 
 
     if (outcome === 'quality_fail') {
       if (s.counted) {
-        await c.query('UPDATE quota_cells SET count = greatest(0, count - 1), full_announced = false WHERE request_id=$1 AND quota_key = ANY($2)', [r.id, s.quota_ids]);
-        await c.query('UPDATE audience_requests SET completes = greatest(0, completes - 1), updated_at=now() WHERE id=$1', [r.id]);
-        await c.query("UPDATE rewards SET status='cancelled', updated_at=now() WHERE session_id=$1", [s.id]);
-        if (r.status === 'closed') await c.query("UPDATE audience_requests SET status='live' WHERE id=$1 AND completes < required_completes", [r.id]);
+        await c.col('quota_cells').updateMany({ request_id: r.id, quota_key: { $in: s.quota_ids } },
+          [{ $set: { count: { $max: [0, { $subtract: ['$count', 1] }] }, full_announced: false } }], c.o);
+        const down = (await c.col('audience_requests').findOneAndUpdate({ id: r.id },
+          [{ $set: { completes: { $max: [0, { $subtract: ['$completes', 1] }] }, updated_at: '$$NOW' } }], { returnDocument: 'after', ...c.o }))!;
+        await c.col('rewards').updateOne({ session_id: s.id }, { $set: { status: 'cancelled', updated_at: new Date() } }, c.o);
+        if (r.status === 'closed' && down.completes < down.required_completes) await updateRequest(c, r.id, { status: 'live' }, { touch: false });
       }
-      await c.query("UPDATE sessions SET verified_outcome='quality_fail', verified_at=now(), status='quality_fail', counted=false, ended_at=COALESCE(ended_at, now()) WHERE id=$1", [s.id]);
+      await endSession(c, s.id, { verified_outcome: 'quality_fail', status: 'quality_fail', counted: false });
       const ev = await emit(c, r, 'quality.failed', { ...base, reason: s.counted ? 'Rejected by the survey host after review' : 'Quality check failed in the survey' });
       if (s.counted) await emitQuotaUpdate(c, r, ev.eventId);
       return { recorded: true, status: 'quality_fail' };
     }
 
-    await c.query('UPDATE sessions SET verified_outcome=$2, verified_at=now(), status=$2, ended_at=COALESCE(ended_at, now()) WHERE id=$1', [s.id, outcome]);
-    const routed = await one<{ to_request: string | null }>(c, 'SELECT to_request FROM routing_decisions WHERE from_session=$1 ORDER BY id DESC LIMIT 1', [s.id]);
+    await endSession(c, s.id, { verified_outcome: outcome, status: outcome });
+    const routed = await one<{ to_request: string | null }>(c, 'routing_decisions', { from_session: s.id }, { projection: { _id: 0, to_request: 1 }, sort: { id: -1 } });
     await emit(c, r, 'survey.screenout', { ...base, outcome, routedTo: routed?.to_request ?? null });
     return { recorded: true, status: outcome };
   });

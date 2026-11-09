@@ -1,14 +1,14 @@
 /**
  * Outbound events: transactional outbox, at-least-once delivery with backoff and dead letter
  * (§6.3). Inbound events: signature checked by auth, envelope and payload validated, deduped on
- * eventId in the inbox table, applied in the same transaction as the inbox insert.
+ * eventId in the inbox collection, applied in the same transaction as the inbox insert.
  */
 import {
   makeEvent, signRequest, withoutRespondent, type EventEnvelope, type EventType, type SystemName,
 } from '@sampledge/contracts';
 import type { z } from 'zod';
 import type { EVENT_PAYLOADS } from '@sampledge/contracts';
-import { many, one, type Db, type Queryable } from '../db';
+import { asJson, many, type Db, type Queryable } from '../db';
 
 export interface RequestRef {
   id: string;
@@ -25,7 +25,8 @@ const TO_SUPPLY360: EventType[] = ['audience_request.submitted', 'audience.appro
 interface Destination { id: string; url: string; respondentLevel: boolean }
 
 async function destinations(q: Queryable, req: RequestRef, type: EventType): Promise<Destination[]> {
-  const clients = await many<{ id: string; system: string; webhook_url: string | null }>(q, "SELECT id, system, webhook_url FROM service_clients WHERE active AND webhook_url IS NOT NULL AND system IN ($1, 'SUPPLY360')", [req.source_platform]);
+  const clients = await many<{ id: string; system: string; webhook_url: string | null }>(q, 'service_clients',
+    { active: true, webhook_url: { $type: 'string' }, system: { $in: [req.source_platform, 'SUPPLY360'] } }, { projection: { _id: 0, id: 1, system: 1, webhook_url: 1 }, sort: { _id: 1 } });
   const out: Destination[] = [];
   const source = clients.find((c) => c.system === req.source_platform);
   const sourceUrl = req.spec?.callbackUrl ?? source?.webhook_url ?? null;
@@ -52,9 +53,14 @@ export async function emit<T extends EventType>(
   });
   for (const d of await destinations(q, req, type)) {
     const body = d.respondentLevel ? env : withoutRespondent(env);
-    await q.query(
-      'INSERT INTO outbox (event_id, type, correlation_id, destination, url, envelope) VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT DO NOTHING',
-      [env.eventId, type, req.id, d.id, d.url, JSON.stringify(body)],
+    // The event id is new, so (event_id, destination) cannot clash; upsert keeps a retried transaction idempotent.
+    await q.col('outbox').updateOne(
+      { event_id: env.eventId, destination: d.id },
+      { $setOnInsert: {
+        id: await q.nextId('outbox'), type, correlation_id: req.id, url: d.url, envelope: asJson(body), status: 'pending', attempts: 0,
+        next_attempt_at: new Date(), locked_until: null, last_status: null, last_error: null, created_at: new Date(), delivered_at: null,
+      } },
+      { upsert: true, ...q.o },
     );
   }
   return env;
@@ -64,16 +70,20 @@ export const MAX_ATTEMPTS = 8;
 export const retryDelayMs = (attempt: number, random = Math.random) =>
   Math.round(Math.min(3_600_000, 30_000 * 2 ** Math.max(0, attempt - 1)) * (1 + 0.2 * (random() * 2 - 1)));
 
-/** Deliver due outbox rows. Safe with several workers (SKIP LOCKED + lease). */
+/** Deliver due outbox documents. Safe with several workers: each is claimed with a 30 s lease. */
 export async function deliverOutbox(db: Db, secretFor: (clientId: string) => Promise<{ clientId: string; secret: string } | null>, limit = 50): Promise<number> {
-  const rows = await many<{ id: string; destination: string; url: string; envelope: EventEnvelope; attempts: number; event_id: string }>(
-    db,
-    `UPDATE outbox SET locked_until = now() + interval '30 seconds'
-     WHERE id IN (SELECT id FROM outbox WHERE status = 'pending' AND next_attempt_at <= now() AND (locked_until IS NULL OR locked_until < now())
-                  ORDER BY id LIMIT $1 FOR UPDATE SKIP LOCKED)
-     RETURNING id, destination, url, envelope, attempts, event_id`,
-    [limit],
-  );
+  type Row = { id: number; destination: string; url: string; envelope: EventEnvelope; attempts: number; event_id: string };
+  const rows: Row[] = [];
+  for (let i = 0; i < limit; i++) {
+    const now = new Date();
+    const r = await db.col('outbox').findOneAndUpdate(
+      { status: 'pending', next_attempt_at: { $lte: now }, $or: [{ locked_until: null }, { locked_until: { $lt: now } }] },
+      { $set: { locked_until: new Date(now.getTime() + 30_000) } },
+      { sort: { id: 1 }, projection: { _id: 0, id: 1, destination: 1, url: 1, envelope: 1, attempts: 1, event_id: 1 }, returnDocument: 'after' },
+    );
+    if (!r) break;
+    rows.push(r as unknown as Row);
+  }
   for (const r of rows) {
     const body = JSON.stringify(r.envelope);
     let status: number | null = null;
@@ -91,24 +101,27 @@ export async function deliverOutbox(db: Db, secretFor: (clientId: string) => Pro
     }
     const attempts = r.attempts + 1;
     if (status !== null && status >= 200 && status < 300) {
-      await db.query("UPDATE outbox SET status='delivered', attempts=$2, last_status=$3, last_error=NULL, delivered_at=now(), locked_until=NULL WHERE id=$1", [r.id, attempts, status]);
+      await db.col('outbox').updateOne({ id: r.id }, { $set: { status: 'delivered', attempts, last_status: status, last_error: null, delivered_at: new Date(), locked_until: null } });
       continue;
     }
     const permanent = status !== null && status >= 400 && status < 500 && status !== 408 && status !== 429;
     const dead = permanent || attempts >= MAX_ATTEMPTS;
-    await db.query(
-      `UPDATE outbox SET status=$2, attempts=$3, last_status=$4, last_error=$5, locked_until=NULL,
-         next_attempt_at = now() + ($6::text || ' milliseconds')::interval WHERE id=$1`,
-      [r.id, dead ? 'dead' : 'pending', attempts, status, error ?? `HTTP ${status}`, String(retryDelayMs(attempts))],
-    );
+    await db.col('outbox').updateOne({ id: r.id }, { $set: {
+      status: dead ? 'dead' : 'pending', attempts, last_status: status, last_error: error ?? `HTTP ${status}`, locked_until: null,
+      next_attempt_at: new Date(Date.now() + retryDelayMs(attempts)),
+    } });
   }
   return rows.length;
 }
 
 /** Record an inbound event once. Returns false when it was already processed. */
 export async function claimInbound(q: Queryable, e: EventEnvelope): Promise<boolean> {
-  const r = await one<{ event_id: string }>(q, 'INSERT INTO inbox (event_id, source, type, correlation_id) VALUES ($1,$2,$3,$4) ON CONFLICT DO NOTHING RETURNING event_id', [e.eventId, e.source, e.type, e.correlationId]);
-  return r !== null;
+  const r = await q.col('inbox').updateOne(
+    { event_id: e.eventId },
+    { $setOnInsert: { source: e.source, type: e.type, correlation_id: e.correlationId, received_at: new Date() } },
+    { upsert: true, ...q.o },
+  );
+  return r.upsertedCount === 1;
 }
 
 export type { SystemName };

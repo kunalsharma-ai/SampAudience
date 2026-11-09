@@ -65,7 +65,9 @@ export class Supply360Client {
   }
 
   private async recordError(operation: string, error: string, requestId?: string) {
-    await this.db.query('INSERT INTO integration_errors (system, operation, request_id, error) VALUES ($1,$2,$3,$4)', ['SUPPLY360', operation, requestId ?? null, error]).catch(() => undefined);
+    try {
+      await this.db.col('integration_errors').insertOne({ id: await this.db.nextId('integration_errors'), system: 'SUPPLY360', operation, request_id: requestId ?? null, error, resolved: false, created_at: new Date() });
+    } catch { /* recording a failure must never hide the failure itself */ }
   }
 
   attributes() { return this.call<{ attributes: AttributeDef[] }>('GET', '/attributes').then((r) => r.attributes); }

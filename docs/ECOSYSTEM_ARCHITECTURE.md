@@ -230,7 +230,7 @@ retries.
 When SUPPLY360's own panels cannot fill a request, SUPPLY360 buys sample from an outside partner
 (a *partner fill*). SAMPLEON gives each partner its own entry link and counts the partner's
 completes from the survey host's verified outcome, so nobody has to trust the partner's own
-count. Migration `002_partner_sources.sql`, module `src/modules/partners.ts`.
+count. Schema step `002_partner_sources` in `src/migrate.ts`, module `src/modules/partners.ts`.
 
 - **Add a partner.** `POST /api/v1/audience-requests/{id}/partners` (SUPPLY360's signed client, or
   a supply admin or manager) with `{ partnerRef, name, country, cap, completeUrl?, screenoutUrl?,

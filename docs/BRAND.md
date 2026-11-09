@@ -17,7 +17,7 @@ values `PROJEXA` and `ZAPX` (`source.platform`, client ids, filters in the API) 
 | Product name in SUPPLY360, PROJEXA and ZAPX screens, buttons and help text | API paths (`/sampleon/v1/...`, `/api/v1/integrations/sampleon/...`) |
 | Feasibility assumptions text | Environment variables (`SAMPLEON_URL`, `SAMPLEON_CLIENT_SECRET`, ...) |
 | | S2S client id `sampleon`, event `source: 'SAMPLEON'`, ZAPX vendor code `SAMPLEON` (`vid=SAMPLEON`) |
-| | Database tables, columns and migrations, staff token prefix `son_` |
+| | Database collections, fields and schema steps, staff token prefix `son_` |
 
 Renaming the identifiers would break signed requests, stored events and launch links already in
 the field. If they are renamed later, do it in all four repositories at once and keep the old

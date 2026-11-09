@@ -11,11 +11,14 @@
     "test": "node --test --test-concurrency=1 dist/test/*.test.js"
   },
   "dependencies": {
-    "@sampledge/contracts": "*",
     "@anthropic-ai/sdk": "1.6.0",
-    "fastify": "5.12.8",
-    "pg": "8.23.1",
+    "@sampledge/contracts": "*",
+    "express": "5.2.1",
+    "mongodb": "7.7.0",
     "zod": "4.6.7"
   },
-  "devDependencies": { "@types/pg": "8.15.6" }
+  "devDependencies": {
+    "@types/express": "5.0.6",
+    "mongodb-memory-server": "11.3.0"
+  }
 }

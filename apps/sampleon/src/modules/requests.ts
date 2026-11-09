@@ -3,7 +3,8 @@ import {
   AudienceRequestChange, AudienceRequestInput, newAudienceRequestId, type AudienceRequestSpec, type RequestStatus,
 } from '@sampledge/contracts';
 import type { Config } from '../config';
-import { many, one, tx, type Db, type Queryable } from '../db';
+import { asJson, count, many, NO_ID, one, tx, type Db, type Queryable } from '../db';
+import { CLOSED_STATUSES } from '../migrate';
 import { actorId, badRequest, conflict, forbidden, notFound, parse, type Actor } from '../http';
 import type { Supply360Client } from '../supply360';
 import { emit, type RequestRef } from './events';
@@ -32,13 +33,35 @@ export interface RequestRow extends RequestRef {
 }
 
 export async function audit(q: Queryable, actor: string, action: string, requestId: string | null, detail: unknown = {}) {
-  await q.query('INSERT INTO audit_log (actor, action, request_id, detail) VALUES ($1,$2,$3,$4)', [actor, action, requestId, JSON.stringify(detail)]);
+  await q.col('audit_log').insertOne({ id: await q.nextId('audit_log'), actor, action, request_id: requestId, detail: asJson(detail ?? {}), created_at: new Date() }, q.o);
 }
 
+/** Fields stored on a request document beyond RequestRow: `open` backs the one-open-request index, `lock_version` the row lock. */
+const HIDDEN = { ...NO_ID, open: 0, lock_version: 0 } as const;
+
+/**
+ * Load a request. With `lock` inside a transaction it is written to (like SELECT … FOR UPDATE):
+ * a second transaction locking the same request then conflicts and runs again after this one.
+ */
 export async function loadRequest(q: Queryable, id: string, lock = false): Promise<RequestRow> {
-  const r = await one<RequestRow>(q, `SELECT * FROM audience_requests WHERE id = $1${lock ? ' FOR UPDATE' : ''}`, [id]);
+  const r = lock && q.session
+    ? await q.col('audience_requests').findOneAndUpdate({ id }, { $inc: { lock_version: 1 } }, { projection: HIDDEN, returnDocument: 'after', ...q.o })
+    : await q.col('audience_requests').findOne({ id }, { projection: HIDDEN, ...q.o });
   if (!r) throw notFound('Unknown audience request');
-  return r;
+  return r as unknown as RequestRow;
+}
+
+/** Change a request; keeps `open` in step with the status and touches updated_at unless told not to. */
+export async function updateRequest(q: Queryable, id: string, set: Partial<RequestRow> & Record<string, unknown>, opts: { inc?: Record<string, number>; touch?: boolean; filter?: Record<string, unknown> } = {}) {
+  const $set: Record<string, unknown> = { ...set };
+  if (opts.touch !== false) $set.updated_at = new Date();
+  if (typeof set.status === 'string') $set.open = !(CLOSED_STATUSES as readonly string[]).includes(set.status);
+  const r = await q.col('audience_requests').findOneAndUpdate(
+    { id, ...opts.filter },
+    { $set, ...(opts.inc ? { $inc: opts.inc } : {}) },
+    { projection: HIDDEN, returnDocument: 'after', ...q.o },
+  );
+  return r as unknown as RequestRow | null;
 }
 
 /** Who may see a request: staff (org_viewer only its organisation), and the client of its source system. */
@@ -80,19 +103,26 @@ export async function createRequest(db: Db, cfg: Config, actor: Actor, body: unk
   const id = newAudienceRequestId();
   const hostClientId = (body as { survey?: { hostId?: string } })?.survey?.hostId ?? cfg.defaultSurveyHost;
   return tx(db, async (c) => {
-    const existing = await one<{ id: string; status: string }>(c, "SELECT id, status FROM audience_requests WHERE source_platform=$1 AND source_project_id=$2 AND survey_id=$3 AND status NOT IN ('closed','rejected','cancelled')", [spec.source.platform, spec.source.projectId, spec.source.surveyId]);
+    const existing = await one<{ id: string; status: string }>(c, 'audience_requests', {
+      source_platform: spec.source.platform, source_project_id: spec.source.projectId, survey_id: spec.source.surveyId, open: true,
+    });
     if (existing) throw conflict('An open audience request already exists for this project and survey', { audienceRequestId: existing.id, status: existing.status });
-    const r = await one<RequestRow>(
-      c,
-      `INSERT INTO audience_requests (id, status, source_platform, source_project_id, survey_id, organization_id, organization_name, title, spec, countries,
-         required_completes, host_client_id, created_by, created_via)
-       VALUES ($1,'submitted',$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING *`,
-      [id, spec.source.platform, spec.source.projectId, spec.source.surveyId, spec.organization.id, spec.organization.name, spec.title ?? null,
-        JSON.stringify(spec), spec.countries, spec.requiredCompletes, hostClientId, actorId(actor), actor.kind === 'client' ? 'client' : 'console'],
-    );
+    const now = new Date();
+    const r: RequestRow = {
+      id, status: 'submitted', source_platform: spec.source.platform, source_project_id: spec.source.projectId, survey_id: spec.source.surveyId,
+      organization_id: spec.organization.id, organization_name: spec.organization.name, title: spec.title ?? null, spec: asJson(spec), countries: spec.countries,
+      required_completes: spec.requiredCompletes, completes: 0, host_client_id: hostClientId, created_by: actorId(actor), created_via: actor.kind === 'client' ? 'client' : 'console',
+      approved_by: null, approved_at: null, decision_note: null, launch_mode: null, soft_launch_target: null, auto_batches: false, quota_sequence: 0,
+      created_at: now, updated_at: now,
+    };
+    // A parallel create for the same survey hits the one-open index; that is the same conflict.
+    await c.col('audience_requests').insertOne({ ...r, open: true, lock_version: 0 }, c.o).catch((e) => {
+      if ((e as { code?: number }).code === 11000) throw conflict('An open audience request already exists for this project and survey');
+      throw e;
+    });
     await audit(c, actorId(actor), 'request.created', id, { source: spec.source });
-    await emit(c, r!, 'audience_request.submitted', { title: spec.title ?? null, countries: spec.countries, requiredCompletes: spec.requiredCompletes, status: 'submitted' });
-    return r!;
+    await emit(c, r, 'audience_request.submitted', { title: spec.title ?? null, countries: spec.countries, requiredCompletes: spec.requiredCompletes, status: 'submitted' });
+    return r;
   });
 }
 
@@ -116,7 +146,7 @@ export async function changeRequest(db: Db, actor: Actor, id: string, body: unkn
       survey: { ...r.spec.survey, ...(change.survey?.launchUrl ? { launchUrl: change.survey.launchUrl } : {}) },
     };
     const checked = parse(AudienceRequestInput, spec);
-    await c.query('UPDATE audience_requests SET spec=$2, required_completes=$3, updated_at=now() WHERE id=$1', [id, JSON.stringify(checked), checked.requiredCompletes]);
+    await updateRequest(c, id, { spec: asJson(checked), required_completes: checked.requiredCompletes });
     if (['approved', 'soft_launch', 'live', 'paused'].includes(r.status)) await syncQuotaCells(c, id, checked, await allocationTargets(c, id));
     await audit(c, actorId(actor), 'request.changed', id, change);
     const updated = await loadRequest(c, id);
@@ -156,16 +186,17 @@ export interface Feasibility {
 
 /** Share of delivered invitations that started a survey, from SAMPLEON history (≥200 invitations), else the default. */
 async function responseRate(q: Queryable, cfg: Config, country: string, panel?: string) {
-  const r = await one<{ delivered: string; started: string }>(
-    q,
-    `SELECT count(*) FILTER (WHERE i.status IN ('delivered','opened')) AS delivered,
-            count(DISTINCT s.invitation_id) AS started
-     FROM invitations i LEFT JOIN sessions s ON s.invitation_id = i.id
-     WHERE i.country = $1 AND ($2::text IS NULL OR i.panel = $2)`,
-    [country, panel ?? null],
-  );
-  const delivered = Number(r?.delivered ?? 0);
-  return delivered >= 200 ? Math.max(0.01, Number(r!.started) / delivered) : cfg.defaultResponseRate;
+  const [r] = await q.col('invitations').aggregate<{ delivered: number; started: number }>([
+    { $match: { country, ...(panel ? { panel } : {}) } },
+    { $lookup: { from: 'sessions', localField: 'id', foreignField: 'invitation_id', as: 's', pipeline: [{ $limit: 1 }, { $project: { _id: 1 } }] } },
+    { $group: {
+      _id: null,
+      delivered: { $sum: { $cond: [{ $in: ['$status', ['delivered', 'opened']] }, 1, 0] } },
+      started: { $sum: { $cond: [{ $gt: [{ $size: '$s' }, 0] }, 1, 0] } },
+    } },
+  ], q.o).toArray();
+  const delivered = r?.delivered ?? 0;
+  return delivered >= 200 ? Math.max(0.01, r!.started / delivered) : cfg.defaultResponseRate;
 }
 
 /** Split `total` in proportion to `weights` (largest remainder), each capped at `caps`. */
@@ -271,13 +302,12 @@ export async function runFeasibility(db: Db, cfg: Config, supply: Supply360Clien
   const f = await calculateFeasibility(db, cfg, supply, r);
   return tx(db, async (c) => {
     const cur = await loadRequest(c, id, true);
-    await c.query('INSERT INTO feasibility_snapshots (request_id, result) VALUES ($1,$2)', [id, JSON.stringify(f)]);
+    await c.col('feasibility_snapshots').insertOne({ id: await c.nextId('feasibility_snapshots'), request_id: id, result: asJson(f), created_at: new Date() }, c.o);
     if (cur.status === 'submitted') {
-      await c.query("UPDATE audience_requests SET status='feasibility_ready', updated_at=now() WHERE id=$1", [id]);
-      await c.query('DELETE FROM allocations WHERE request_id=$1', [id]);
-      for (const [country, panels] of Object.entries(f.recommendedAllocation)) for (const [panel, n] of Object.entries(panels)) {
-        await c.query('INSERT INTO allocations (request_id, country, panel, target) VALUES ($1,$2,$3,$4)', [id, country, panel, n]);
-      }
+      await updateRequest(c, id, { status: 'feasibility_ready' });
+      await c.col('allocations').deleteMany({ request_id: id }, c.o);
+      const docs = Object.entries(f.recommendedAllocation).flatMap(([country, panels]) => Object.entries(panels).map(([panel, n]) => ({ request_id: id, country, panel, target: n })));
+      if (docs.length) await c.col('allocations').insertMany(docs, c.o);
     }
     await emit(c, cur, 'feasibility.calculated', {
       feasible: f.feasible, eligible: f.eligible, reachable: f.reachable, estimatedCompletes: f.estimatedCompletes, shortfall: f.shortfall,
@@ -291,8 +321,10 @@ export async function runFeasibility(db: Db, cfg: Config, supply: Supply360Clien
 // ---- Approval -------------------------------------------------------------------------------
 
 export async function allocationTargets(q: Queryable, id: string): Promise<Record<string, number>> {
-  const rows = await many<{ country: string; target: string }>(q, 'SELECT country, sum(target) AS target FROM allocations WHERE request_id=$1 GROUP BY country', [id]);
-  return Object.fromEntries(rows.map((r) => [r.country, Number(r.target)]));
+  const rows = await q.col('allocations').aggregate<{ _id: string; target: number }>([
+    { $match: { request_id: id } }, { $group: { _id: '$country', target: { $sum: '$target' } } },
+  ], q.o).toArray();
+  return Object.fromEntries(rows.map((r) => [r._id, r.target]));
 }
 
 /** One cell per country (key country:XX, target = the country's completes) plus the request's quota definitions. */
@@ -300,27 +332,27 @@ export async function syncQuotaCells(q: Queryable, id: string, spec: AudienceReq
   const countryTargets = spec.completesByCountry && Object.keys(spec.completesByCountry).length
     ? spec.completesByCountry
     : Object.keys(alloc).length ? alloc : apportion(spec.requiredCompletes, Object.fromEntries(spec.countries.map((c) => [c, 1])));
-  const keys: string[] = [];
-  for (const country of spec.countries) {
-    const key = `country:${country}`;
-    keys.push(key);
-    await q.query(
-      `INSERT INTO quota_cells (request_id, quota_key, label, country, conditions, target, hard) VALUES ($1,$2,$3,$4,'[]',$5,true)
-       ON CONFLICT (request_id, quota_key) DO UPDATE SET target = EXCLUDED.target, full_announced = quota_cells.full_announced AND quota_cells.count >= EXCLUDED.target`,
-      [id, key, country, country, Math.max(0, countryTargets[country] ?? 0)],
-    );
-  }
-  for (const qd of spec.quotas) {
-    keys.push(qd.id);
-    await q.query(
-      `INSERT INTO quota_cells (request_id, quota_key, label, country, conditions, target, hard) VALUES ($1,$2,$3,$4,$5,$6,$7)
-       ON CONFLICT (request_id, quota_key) DO UPDATE SET target=EXCLUDED.target, conditions=EXCLUDED.conditions, hard=EXCLUDED.hard, label=EXCLUDED.label,
-         full_announced = quota_cells.full_announced AND quota_cells.count >= EXCLUDED.target`,
-      [id, qd.id, qd.label ?? qd.id, qd.country ?? null, JSON.stringify(qd.conditions), qd.target, qd.hard],
-    );
+  const cells: { key: string; label: string; country: string | null; conditions: unknown; target: number; hard: boolean; country_cell: boolean }[] = [
+    ...spec.countries.map((country) => ({ key: `country:${country}`, label: country, country, conditions: [], target: Math.max(0, countryTargets[country] ?? 0), hard: true, country_cell: true })),
+    ...spec.quotas.map((qd) => ({ key: qd.id, label: qd.label ?? qd.id, country: qd.country ?? null, conditions: asJson(qd.conditions), target: qd.target, hard: qd.hard, country_cell: false })),
+  ];
+  for (const cell of cells) {
+    const prior = await one<{ count: number; full_announced: boolean }>(q, 'quota_cells', { request_id: id, quota_key: cell.key });
+    if (!prior) {
+      await q.col('quota_cells').insertOne({
+        id: await q.nextId('quota_cells'), request_id: id, quota_key: cell.key, label: cell.label, country: cell.country, conditions: cell.conditions,
+        target: cell.target, count: 0, hard: cell.hard, full_announced: false,
+      }, q.o);
+      continue;
+    }
+    // A cell stays announced as full only while it is still full at the new target. Country cells keep their label and conditions.
+    const full_announced = prior.full_announced && prior.count >= cell.target;
+    await q.col('quota_cells').updateOne({ request_id: id, quota_key: cell.key }, {
+      $set: cell.country_cell ? { target: cell.target, full_announced } : { target: cell.target, conditions: cell.conditions, hard: cell.hard, label: cell.label, full_announced },
+    }, q.o);
   }
   // Removed quotas stop counting but keep their history.
-  await q.query('UPDATE quota_cells SET target = count, hard = true WHERE request_id=$1 AND NOT (quota_key = ANY($2))', [id, keys]);
+  await q.col('quota_cells').updateMany({ request_id: id, quota_key: { $nin: cells.map((c) => c.key) } }, [{ $set: { target: '$count', hard: true } }], q.o);
 }
 
 export async function decide(db: Db, actor: Actor, id: string, approve: boolean, body: { note?: string; allocation?: Record<string, Record<string, number>> }) {
@@ -330,22 +362,24 @@ export async function decide(db: Db, actor: Actor, id: string, approve: boolean,
     if (r.status !== 'feasibility_ready') throw conflict(r.status === 'submitted' ? 'Calculate feasibility before deciding' : `A ${r.status} request cannot be decided`);
     if (r.created_by === actorId(actor)) throw forbidden('The requester cannot approve their own request');
     if (!approve) {
-      await c.query("UPDATE audience_requests SET status='rejected', decision_note=$2, approved_by=$3, updated_at=now() WHERE id=$1", [id, body.note ?? null, actorId(actor)]);
+      await updateRequest(c, id, { status: 'rejected', decision_note: body.note ?? null, approved_by: actorId(actor) });
       await audit(c, actorId(actor), 'request.rejected', id, { note: body.note });
       return loadRequest(c, id);
     }
     if (body.allocation) {
-      await c.query('DELETE FROM allocations WHERE request_id=$1', [id]);
+      const docs: { request_id: string; country: string; panel: string; target: number }[] = [];
       for (const [country, panels] of Object.entries(body.allocation)) {
         if (!r.countries.includes(country)) throw badRequest(`${country} is not one of the request's countries`);
         for (const [panel, n] of Object.entries(panels)) {
           if (!Number.isInteger(n) || n < 0) throw badRequest('Allocation targets are whole numbers');
-          await c.query('INSERT INTO allocations (request_id, country, panel, target) VALUES ($1,$2,$3,$4)', [id, country, panel, n]);
+          docs.push({ request_id: id, country, panel, target: n });
         }
       }
+      await c.col('allocations').deleteMany({ request_id: id }, c.o);
+      if (docs.length) await c.col('allocations').insertMany(docs, c.o);
     }
-    const alloc = await many<{ country: string; panel: string; target: number }>(c, 'SELECT country, panel, target FROM allocations WHERE request_id=$1', [id]);
-    await c.query("UPDATE audience_requests SET status='approved', approved_by=$2, approved_at=now(), decision_note=$3, updated_at=now() WHERE id=$1", [id, actorId(actor), body.note ?? null]);
+    const alloc = await many<{ country: string; panel: string; target: number }>(c, 'allocations', { request_id: id }, { projection: { _id: 0, country: 1, panel: 1, target: 1 }, sort: { _id: 1 } });
+    await updateRequest(c, id, { status: 'approved', approved_by: actorId(actor), approved_at: new Date(), decision_note: body.note ?? null });
     // Country cells follow the request's country targets; the allocation decides which panels get invitations.
     await syncQuotaCells(c, id, r.spec, {});
     await audit(c, actorId(actor), 'request.approved', id, { allocation: alloc });
@@ -360,14 +394,14 @@ export async function decide(db: Db, actor: Actor, id: string, approve: boolean,
 
 export async function quotaFill(q: Queryable, id: string) {
   return many<{ quota_key: string; label: string | null; country: string | null; target: number; count: number; hard: boolean; full_announced: boolean; conditions: unknown }>(
-    q, 'SELECT quota_key, label, country, target, count, hard, full_announced, conditions FROM quota_cells WHERE request_id=$1 ORDER BY id', [id],
+    q, 'quota_cells', { request_id: id }, { projection: { _id: 0, quota_key: 1, label: 1, country: 1, target: 1, count: 1, hard: 1, full_announced: 1, conditions: 1 }, sort: { id: 1 } },
   );
 }
 
 /** Absolute counters with a sequence number, so a late event never rolls a number back (§6.3). */
 export async function emitQuotaUpdate(q: Queryable, r: RequestRow, causationId?: string) {
-  const seq = await one<{ quota_sequence: number }>(q, 'UPDATE audience_requests SET quota_sequence = quota_sequence + 1 WHERE id=$1 RETURNING quota_sequence', [r.id]);
-  const cur = await one<{ completes: number; required_completes: number }>(q, 'SELECT completes, required_completes FROM audience_requests WHERE id=$1', [r.id]);
+  const cur = await updateRequest(q, r.id, {}, { inc: { quota_sequence: 1 }, touch: false });
+  const seq = cur;
   const cells = await quotaFill(q, r.id);
   const byCountry: Record<string, { target: number; completes: number }> = {};
   for (const c of cells.filter((c) => c.quota_key.startsWith('country:'))) byCountry[c.country!] = { target: c.target, completes: c.count };
@@ -390,8 +424,8 @@ export async function setStatus(db: Db, actor: Actor, id: string, to: 'paused' |
     else if (to === 'resume') { if (r.status !== 'paused') throw conflict('Only a paused request resumes'); next = r.launch_mode === 'soft' ? 'soft_launch' : 'live'; }
     else if (to === 'cancelled') { if (!['submitted', 'feasibility_ready', 'approved'].includes(r.status)) throw conflict('Only a request that has not launched can be cancelled; close it instead'); next = 'cancelled'; }
     else { if (['closed', 'rejected', 'cancelled'].includes(r.status)) throw conflict(`Already ${r.status}`); next = 'closed'; }
-    await c.query('UPDATE audience_requests SET status=$2, updated_at=now() WHERE id=$1', [id, next]);
-    if (next === 'paused' || next === 'closed' || next === 'cancelled') await c.query("UPDATE batches SET status='cancelled' WHERE request_id=$1 AND status='scheduled'", [id]);
+    await updateRequest(c, id, { status: next });
+    if (next === 'paused' || next === 'closed' || next === 'cancelled') await c.col('batches').updateMany({ request_id: id, status: 'scheduled' }, { $set: { status: 'cancelled' } }, c.o);
     await audit(c, actorId(actor), `request.${next}`, id, { reason });
     if (next === 'closed') {
       await emit(c, r, 'project.closed', { reason: reason ?? 'closed', progress: { required: r.required_completes, completes: r.completes, remaining: Math.max(0, r.required_completes - r.completes) } });
@@ -402,14 +436,15 @@ export async function setStatus(db: Db, actor: Actor, id: string, to: 'paused' |
 
 /** Full view of a request for its owner or staff. Reward cost is hidden from org viewers and source systems. */
 export async function requestView(q: Queryable, actor: Actor, r: RequestRow) {
-  const [feas, alloc, cells, batches, outcomes, routing] = await Promise.all([
-    one<{ result: Feasibility }>(q, 'SELECT result FROM feasibility_snapshots WHERE request_id=$1 ORDER BY id DESC LIMIT 1', [r.id]),
-    many(q, 'SELECT country, panel, target FROM allocations WHERE request_id=$1 ORDER BY country, panel', [r.id]),
-    quotaFill(q, r.id),
-    many(q, 'SELECT id, mode, size, scheduled_at, auto, status, selected, delivered, suppressed, error, sent_at FROM batches WHERE request_id=$1 ORDER BY created_at', [r.id]),
-    many<{ status: string; n: string }>(q, 'SELECT status, count(*) AS n FROM sessions WHERE request_id=$1 GROUP BY status', [r.id]),
-    one<{ total: string; routed: string }>(q, 'SELECT count(*) AS total, count(to_request) AS routed FROM routing_decisions WHERE from_request=$1', [r.id]),
-  ]);
+  // Sequential: reads in one transaction cannot run in parallel on its session.
+  const feas = await one<{ result: Feasibility }>(q, 'feasibility_snapshots', { request_id: r.id }, { projection: { _id: 0, result: 1 }, sort: { id: -1 } });
+  const alloc = await many(q, 'allocations', { request_id: r.id }, { projection: { _id: 0, country: 1, panel: 1, target: 1 }, sort: { country: 1, panel: 1 } });
+  const cells = await quotaFill(q, r.id);
+  const batches = await many(q, 'batches', { request_id: r.id }, {
+    projection: { _id: 0, id: 1, mode: 1, size: 1, scheduled_at: 1, auto: 1, status: 1, selected: 1, delivered: 1, suppressed: 1, error: 1, sent_at: 1 }, sort: { created_at: 1, _id: 1 },
+  });
+  const outcomes = await q.col('sessions').aggregate<{ _id: string; n: number }>([{ $match: { request_id: r.id } }, { $group: { _id: '$status', n: { $sum: 1 } } }], q.o).toArray();
+  const routing = { total: await count(q, 'routing_decisions', { from_request: r.id }), routed: await count(q, 'routing_decisions', { from_request: r.id, to_request: { $type: 'string' } }) };
   const showCost = actor.kind === 'user' && actor.role !== 'org_viewer';
   const spec = showCost ? r.spec : { ...r.spec, reward: { points: r.spec.reward.points } };
   return {
@@ -428,8 +463,8 @@ export async function requestView(q: Queryable, actor: Actor, r: RequestRow) {
     allocation: alloc,
     quotas: cells.map((c) => ({ id: c.quota_key, label: c.label, country: c.country, target: c.target, completes: c.count, hard: c.hard, full: c.count >= c.target })),
     batches,
-    outcomes: Object.fromEntries(outcomes.map((o) => [o.status, Number(o.n)])),
-    routing: { decisions: Number(routing?.total ?? 0), routed: Number(routing?.routed ?? 0) },
+    outcomes: Object.fromEntries(outcomes.map((o) => [o._id, o.n])) as Record<string, number>,
+    routing: { decisions: routing.total, routed: routing.routed },
     ...(mayReadPartners(actor) ? { partners: await partnersOf(q, null, r.id) } : {}),
     createdAt: r.created_at,
     updatedAt: r.updated_at,

@@ -40,6 +40,27 @@ are fixed and covered by tests.
 - **`project.created` from PROJEXA**: PROJEXA now sends it when a project is created or copied
   (PROJEXA repository), so SAMPLEON knows the project before its first audience request.
 
+## Changed 2026-11-09: Express and MongoDB
+
+The service moved from Fastify + PostgreSQL to **Express 5 + MongoDB** (driver 7, server 7 or
+later, run as a replica set because transactions need one). Nothing outside the service changed:
+the same paths, status codes, response bodies, headers, signatures, events and admin commands.
+
+- Tables became collections with the same field names; the unique constraints became unique
+  indexes (one open request per source survey is a partial unique index on an `open` flag kept in
+  step with the status). `src/migrate.ts` creates them on start; the `.sql` files are gone.
+- `SELECT … FOR UPDATE` became a write to the locked document inside a MongoDB transaction, so a
+  second transaction on the same request, session or partner conflicts and runs again after it
+  (`tx()` in `src/db.ts`). Worker claims (`SKIP LOCKED`) became one-at-a-time
+  `findOneAndUpdate` claims. Former serial ids (outbox, routing decisions, audit) come from a
+  `counters` collection, so dead-letter ids are still numbers (sent as strings, as before).
+- `MONGODB_URL` replaces `DATABASE_URL` (still read as a fallback). There was no production data
+  to move, so there is no data migration from PostgreSQL.
+- Tests: the 13 service tests pass unchanged on MongoDB 8.0, plus `test/concurrency.test.ts` (4)
+  for parallel creates, parallel verified completes on a full quota, parallel partner entries and
+  the HTTP edges. A recorded run of the old and new service over the same test traffic gave the
+  same status codes and response and event shapes.
+
 ## Not done yet
 
 - **Claude targeting** is implemented and checked like the rule parser, but the cross-service run

@@ -96,7 +96,7 @@ test('a partner complete counts only when the survey host verifies it, up to the
   assert.equal(list.data[0].counts.completes, 1);
   assert.equal(list.data[0].remaining, 0);
   assert.equal((await json(await h.signed('projexa', 'GET', `/api/v1/audience-requests/${id}`))).completes, 1, 'partner completes count toward the request');
-  assert.equal((await h.db.query('SELECT 1 FROM rewards WHERE request_id=$1', [id])).rowCount, 0, 'the partner pays its own respondents');
+  assert.equal(await h.db.col('rewards').countDocuments({ request_id: id }), 0, 'the partner pays its own respondents');
 
   await h.drain();
   const done = h.supply.events.find((e) => e.type === 'survey.completed' && e.correlationId === id)!;
@@ -113,7 +113,7 @@ test('a partner complete counts only when the survey host verifies it, up to the
   await h.signed('supply360', 'POST', `/api/v1/audience-requests/${id}/partners`, partner({ partnerRef: 'pf_cap', cap: 3 }));
   const t3 = tokenFrom((await entry('v-3')).location!);
   partnerBack((await h.follow(`/r/screenout?token=${encodeURIComponent(t3)}`)).location, p.secret, 'https://vendor.example/term', 'v-3', 'terminate');
-  assert.equal((await h.db.query('SELECT 1 FROM routing_decisions WHERE from_request=$1', [id])).rowCount, 0);
+  assert.equal(await h.db.col('routing_decisions').countDocuments({ from_request: id }), 0);
 
   // A verified complete later rejected by the host is taken off the partner's count.
   assert.equal((await h.hostOutcome(t1, 'quality_fail')).status, 200);

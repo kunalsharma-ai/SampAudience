@@ -1,4 +1,4 @@
-import type { FastifyReply, FastifyRequest } from 'fastify';
+import type { Request, Response } from 'express';
 import type { ZodType } from 'zod';
 
 export class HttpError extends Error {
@@ -24,14 +24,17 @@ export type Actor =
 export const ROLES = ['supply_admin', 'supply_approver', 'supply_manager', 'viewer', 'org_viewer'] as const;
 export type Role = (typeof ROLES)[number];
 
-declare module 'fastify' {
-  interface FastifyRequest {
-    rawBody?: string;
-    actor?: Actor;
+declare global {
+  // eslint-disable-next-line @typescript-eslint/no-namespace
+  namespace Express {
+    interface Request {
+      rawBody?: string;
+      actor?: Actor;
+    }
   }
 }
 
-export const actorOf = (req: FastifyRequest): Actor => {
+export const actorOf = (req: Request): Actor => {
   if (!req.actor) throw new HttpError(401, 'Sign in or sign the request');
   return req.actor;
 };
@@ -42,8 +45,12 @@ export function requireRole(a: Actor, roles: Role[]): asserts a is Extract<Actor
   if (a.kind !== 'user' || !roles.includes(a.role)) throw forbidden(`Needs one of: ${roles.join(', ')}`);
 }
 
-export const sendError = (reply: FastifyReply, e: unknown) => {
-  if (e instanceof HttpError) return reply.code(e.status).send({ error: e.message, details: e.details });
-  reply.log.error(e);
-  return reply.code(500).send({ error: 'Internal error' });
+export const logError = (e: unknown) => {
+  if (process.env.NODE_ENV !== 'test') console.error(JSON.stringify({ level: 'error', time: new Date().toISOString(), msg: (e as Error)?.message ?? String(e), stack: (e as Error)?.stack }));
+};
+
+export const sendError = (res: Response, e: unknown) => {
+  if (e instanceof HttpError) return res.status(e.status).json({ error: e.message, details: e.details });
+  logError(e);
+  return res.status(500).json({ error: 'Internal error' });
 };
