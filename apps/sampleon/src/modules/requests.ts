@@ -7,6 +7,7 @@ import { many, one, tx, type Db, type Queryable } from '../db';
 import { actorId, badRequest, conflict, forbidden, notFound, parse, type Actor } from '../http';
 import type { Supply360Client } from '../supply360';
 import { emit, type RequestRef } from './events';
+import { mayReadPartners, partnersOf } from './partners';
 
 export interface RequestRow extends RequestRef {
   status: RequestStatus;
@@ -429,6 +430,7 @@ export async function requestView(q: Queryable, actor: Actor, r: RequestRow) {
     batches,
     outcomes: Object.fromEntries(outcomes.map((o) => [o.status, Number(o.n)])),
     routing: { decisions: Number(routing?.total ?? 0), routed: Number(routing?.routed ?? 0) },
+    ...(mayReadPartners(actor) ? { partners: await partnersOf(q, null, r.id) } : {}),
     createdAt: r.created_at,
     updatedAt: r.updated_at,
   };

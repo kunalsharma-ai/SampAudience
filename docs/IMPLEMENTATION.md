@@ -30,12 +30,20 @@ ZAPX read the new request's ID from the wrong response field, and the rule parse
 "professional" in "years of professional experience" as the *professional* panel segment. Both
 are fixed and covered by tests.
 
+## Added 2026-11-09
+
+- **Outside sample partners** (ECOSYSTEM_ARCHITECTURE §5.5): each partner on a request gets its
+  own entry link (`/p/{token}?pid=`), respondents go back to the partner's own links with a
+  signed status, and partner completes count only when the survey host verifies them, up to the
+  partner's cap. Session events carry `partnerRef`, so SUPPLY360 pays partners on verified
+  completes instead of the partner's own report. Tests: `test/partners.test.ts` (3).
+- **`project.created` from PROJEXA**: PROJEXA now sends it when a project is created or copied
+  (PROJEXA repository), so SAMPLEON knows the project before its first audience request.
+
 ## Not done yet
 
-- **`project.created` from PROJEXA** is accepted by SAMPLEON but PROJEXA does not send it yet, so
-  the dashboard's "projects known" count stays at 0.
 - **Claude targeting** is implemented and checked like the rule parser, but the cross-service run
   uses the rule parser so it needs no API key.
-- **External survey providers and panel partners** fit the same contracts (`EXTERNAL` client,
-  survey-host contract), but no partner is onboarded.
+- **External survey providers** fit the same contracts (`EXTERNAL` client, survey-host
+  contract), but none is onboarded.
 - **Production deployment** (hosting, secrets, DNS) is outside these changes.

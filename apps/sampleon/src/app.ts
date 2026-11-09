@@ -11,6 +11,7 @@ import { Supply360Client } from './supply360';
 import { failures, listRequests, replay, requestDetail, summary } from './modules/dashboard';
 import { browserReturn, enter, verifiedOutcome, type FlowResult } from './modules/entry';
 import { receiveEvent } from './modules/inbound';
+import { addPartner, closePartner, listPartners, partnerEnter } from './modules/partners';
 import { launch, scheduleBatch } from './modules/launch';
 import { assertSee, changeRequest, createRequest, decide, loadRequest, requestView, runFeasibility, setStatus } from './modules/requests';
 import { parseTargeting } from './modules/targeting';
@@ -116,6 +117,12 @@ export function buildApp(db: Db, cfg: Config) {
     };
   });
 
+  // ---- Outside sample partners: one entry link each; completes counted from verified outcomes
+  app.post<{ Params: { id: string } }>('/api/v1/audience-requests/:id/partners', async (req, reply) =>
+    idempotent(db, req, reply, async () => addPartner(db, cfg, actorOf(req), req.params.id, req.body), 201));
+  app.get<{ Params: { id: string } }>('/api/v1/audience-requests/:id/partners', async (req) => listPartners(db, cfg, actorOf(req), req.params.id));
+  app.post<{ Params: { id: string; ref: string } }>('/api/v1/audience-requests/:id/partners/:ref/close', async (req) => closePartner(db, cfg, actorOf(req), req.params.id, req.params.ref));
+
   // ---- Targeting
   app.post('/api/v1/targeting/parse', async (req) => {
     const a = actorOf(req);
@@ -137,6 +144,7 @@ export function buildApp(db: Db, cfg: Config) {
 
   // ---- Respondent flow (public) and the host's signed outcome
   app.get<{ Params: { token: string } }>('/go/:token', async (req, reply) => sendFlow(reply, await enter(db, cfg, supply, req.params.token)));
+  app.get<{ Params: { token: string }; Querystring: { pid?: string } }>('/p/:token', async (req, reply) => sendFlow(reply, await partnerEnter(db, req.params.token, req.query.pid)));
   app.get<{ Params: { status: string }; Querystring: { token?: string; rid?: string } }>('/r/:status', async (req, reply) =>
     sendFlow(reply, await browserReturn(db, cfg, supply, req.params.status, req.query.token ?? req.query.rid)));
   app.post('/api/v1/s2s/outcome', async (req) => verifiedOutcome(db, (req.body ?? {}) as Record<string, unknown>));
