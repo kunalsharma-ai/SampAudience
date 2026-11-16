@@ -6,8 +6,10 @@ import { checkAgainstCatalogue } from '@sampledge/contracts';
 import { authMiddleware, bodyParser } from './auth';
 import type { Config } from './config';
 import { asJson, count, isDuplicateKey, one, type Db } from './db';
-import { actorOf, forbidden, HttpError, logError, parse, requireRole, type Actor } from './http';
+import { actorOf, forbidden, HttpError, logError, notFound, parse, requireRole, type Actor } from './http';
+import { Settings, saveSchema } from './settings';
 import { Supply360Client } from './supply360';
+import { listClients, retirePrevious, rotateClient, saveClient } from './modules/clients';
 import { failures, listRequests, replay, requestDetail, summary } from './modules/dashboard';
 import { browserReturn, enter, verifiedOutcome, type FlowResult } from './modules/entry';
 import { receiveEvent } from './modules/inbound';
@@ -47,7 +49,7 @@ const staff = (a: Actor) => { requireRole(a, [...STAFF]); return a; };
 
 type Handler = (req: Request, res: Response) => Promise<unknown>;
 
-export function buildApp(db: Db, cfg: Config) {
+export function buildApp(db: Db, cfg: Config, settings: Settings = new Settings(db, cfg)) {
   const app = express();
   app.disable('x-powered-by');
   app.set('etag', false);
@@ -59,7 +61,7 @@ export function buildApp(db: Db, cfg: Config) {
   app.use(bodyParser());
 
   /** Register a route: resolve the caller, run the handler, send what it returns as JSON. */
-  const on = (method: 'get' | 'post' | 'patch', path: string, fn: Handler) => {
+  const on = (method: 'get' | 'post' | 'patch' | 'put', path: string, fn: Handler) => {
     app[method](path, auth, (req: Request, res: Response, next: NextFunction) => {
       fn(req, res).then((out) => { if (!res.headersSent && out !== undefined) res.json(out); }, next);
     });
@@ -173,6 +175,38 @@ export function buildApp(db: Db, cfg: Config) {
   });
   on('get', '/api/v1/me', async (req) => actorOf(req));
 
+  // ---- Settings: API keys and connections entered in the console, kept (encrypted) in the database
+  const admin = (req: Request) => { const a = actorOf(req); requireRole(a, ['supply_admin']); return a; };
+  on('get', '/api/v1/admin/settings', async (req) => { admin(req); return settings.view(); });
+  on('put', '/api/v1/admin/settings', async (req) => {
+    const a = admin(req);
+    const changed = await settings.save(parse(saveSchema, req.body).values, `user:${a.id}`);
+    return { changed, ...(await settings.view()) };
+  });
+  on('post', '/api/v1/admin/settings/test/:group', async (req) => {
+    admin(req);
+    const group = String(req.params.group);
+    await settings.refresh();
+    if (group === 'supply360') {
+      if (!supply.connected) return { ok: false, message: 'Enter the SUPPLY360 address and signing secret first.' };
+      try { const n = (await supply.attributes()).length; return { ok: true, message: `Connected: SUPPLY360 answered with ${n} profile attributes.` }; }
+      catch (e) { return { ok: false, message: (e as Error).message.slice(0, 300) }; }
+    }
+    if (group === 'ai') {
+      if (!cfg.anthropicApiKey) return { ok: false, message: 'Enter an Anthropic API key first.' };
+      try {
+        const { default: Anthropic } = await import('@anthropic-ai/sdk');
+        const m = await new Anthropic({ apiKey: cfg.anthropicApiKey, timeout: 20_000, maxRetries: 0 }).models.retrieve(cfg.anthropicModel);
+        return { ok: true, message: `Key accepted; model ${m.id} is available.${cfg.aiProvider === 'anthropic' ? '' : ' The engine is set to rules, so it is not used yet.'}` };
+      } catch (e) { return { ok: false, message: (e as Error).message.slice(0, 300) }; }
+    }
+    throw notFound('Unknown settings group');
+  });
+  on('get', '/api/v1/admin/clients', async (req) => { admin(req); return listClients(db); });
+  on('post', '/api/v1/admin/clients', async (req) => saveClient(db, `user:${admin(req).id}`, req.body));
+  on('post', '/api/v1/admin/clients/:id/rotate', async (req) => rotateClient(db, `user:${admin(req).id}`, id(req), req.body));
+  on('post', '/api/v1/admin/clients/:id/retire-previous', async (req) => retirePrevious(db, `user:${admin(req).id}`, id(req)));
+
   const consoleHtml = readFileSync(join(__dirname, '..', '..', 'public', 'console.html'), 'utf8');
   on('get', '/console', async (_req, res) => void res.type('text/html; charset=utf-8').setHeader('cache-control', 'no-store').send(consoleHtml));
   on('get', '/', async (_req, res) => void res.status(302).setHeader('location', '/console').end());
@@ -205,5 +239,5 @@ export function buildApp(db: Db, cfg: Config) {
     return void res.status(500).json({ error: 'Internal error' });
   });
 
-  return { app, supply };
+  return { app, supply, settings };
 }
