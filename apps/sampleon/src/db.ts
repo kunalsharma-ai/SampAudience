@@ -14,7 +14,8 @@ import {
 export type CollectionName =
   | 'service_clients' | 'users' | 'source_projects' | 'audience_requests' | 'feasibility_snapshots' | 'allocations'
   | 'quota_cells' | 'batches' | 'invitations' | 'sessions' | 'routing_decisions' | 'rewards' | 'outbox' | 'inbox'
-  | 'idempotency_keys' | 'integration_errors' | 'audit_log' | 'partner_sources' | 'counters' | 'schema_migrations';
+  | 'idempotency_keys' | 'integration_errors' | 'audit_log' | 'partner_sources' | 'counters' | 'schema_migrations'
+  | 'settings' | 'settings_keys';
 
 /** Collections whose `id` is a number from a counter (the former bigserial ids). */
 export type SequenceName = 'feasibility_snapshots' | 'quota_cells' | 'routing_decisions' | 'outbox' | 'integration_errors' | 'audit_log';

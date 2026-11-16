@@ -43,17 +43,19 @@ npm ci
 npm run build
 # MongoDB 7 or later as a replica set (one node is enough; transactions need a replica set), e.g.
 #   mongod --replSet rs0 --dbpath ./data &  then once:  mongosh --eval 'rs.initiate()'
-export MONGODB_URL='mongodb://localhost:27017/sampleon?replicaSet=rs0'
-export SUPPLY360_URL=http://localhost:4000 SUPPLY360_SECRET=...      # SAMPLEON's secret at SUPPLY360
-node apps/sampleon/dist/src/admin.js client supply360 SUPPLY360 SUPPLY360 http://localhost:4000/api/v1/s2s/supply/events <same secret>
-node apps/sampleon/dist/src/admin.js client projexa PROJEXA PROJEXA https://projexa.example/api/v1/integrations/sampleon/events
-node apps/sampleon/dist/src/admin.js client zapx ZAPX ZAPX https://zapx.example/api/v1/sampleon/events <secret> <outcome secret>
+export MONGODB_URL='mongodb://localhost:27017/sampleon?replicaSet=rs0'   # the only setting needed
+node apps/sampleon/dist/src/admin.js user admin@example.com "Supply Admin" supply_admin   # prints a console token
 node apps/sampleon/dist/src/admin.js user manager@example.com "Supply Manager" supply_manager
 node apps/sampleon/dist/src/admin.js user approver@example.com "Supply Approver" supply_approver
 node apps/sampleon/dist/src/main.js        # API, worker and console on :4600 (console at /console)
 ```
 
-Every setting is in [apps/sampleon/.env.example](apps/sampleon/.env.example). Collections and
+Then sign in to `/console` with the admin token and open **Settings**: enter the SUPPLY360 address and
+signing secret, the Anthropic key (optional), and add SampTrek, SampCode and SUPPLY360 under
+*Connected systems*. Everything is kept, encrypted, in the database; no API key goes in the environment
+([docs/SETTINGS.md](docs/SETTINGS.md)). The `admin.js client ...` command still works for scripts.
+
+The server settings are in [apps/sampleon/.env.example](apps/sampleon/.env.example). Collections and
 indexes are created on start (`src/migrate.ts`; also `node apps/sampleon/dist/src/migrate.js`).
 `DATABASE_URL` is still read when `MONGODB_URL` is not set.
 

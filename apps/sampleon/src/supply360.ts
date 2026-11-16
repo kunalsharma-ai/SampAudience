@@ -40,7 +40,7 @@ export class Supply360Client {
   get connected() { return Boolean(this.cfg.supply360Url && this.cfg.supply360Secret); }
 
   private async call<T>(method: 'GET' | 'POST', path: string, body?: unknown, requestId?: string): Promise<T> {
-    if (!this.connected) throw new Supply360Error('SUPPLY360 is not connected (SUPPLY360_URL and SUPPLY360_SECRET)', 503);
+    if (!this.connected) throw new Supply360Error('SUPPLY360 is not connected: a supply admin enters its address and signing secret in the console under Settings', 503);
     const fullPath = `/api/v1/s2s/supply${path}`;
     const url = new URL(this.cfg.supply360Url!);
     const signedPath = `${url.pathname.replace(/\/+$/, '')}${fullPath}`;

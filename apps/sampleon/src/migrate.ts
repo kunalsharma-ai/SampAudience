@@ -78,6 +78,14 @@ export const MIGRATIONS: { name: string; indexes: Index[] }[] = [
       ['sessions', { partner_source_id: 1, partner_rid: 1 }, { unique: true, partialFilterExpression: { partner_source_id: { $type: 'string' } }, name: 'sessions_partner_rid' }],
     ],
   },
+  {
+    name: '003_settings',
+    indexes: [
+      // API keys and connection details entered in the console (src/settings.ts); one document per setting.
+      ['settings', { key: 1 }, unique],
+      ['settings_keys', { created_at: 1 }],
+    ],
+  },
 ];
 
 /** Create every collection and index not yet set up, in order. Returns the steps applied now. */

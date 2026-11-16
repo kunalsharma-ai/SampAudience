@@ -33,6 +33,9 @@ button.act{background:var(--accent);color:#fff;border:0;border-radius:6px;paddin
 .row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:10px}.muted{color:var(--muted)}.err{color:var(--bad)}
 #login{max-width:420px;margin:12vh auto;background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:20px}#login input{width:100%;margin:8px 0}
 pre{white-space:pre-wrap;word-break:break-word;background:var(--bg);padding:8px;border-radius:6px;font-size:12px}
+.field{display:grid;grid-template-columns:minmax(160px,220px) 1fr;gap:6px 12px;align-items:center;margin:6px 0}.field input,.field select{width:100%}.field .meta{grid-column:2;font-size:12px;color:var(--muted);margin-top:-2px}
+@media (max-width:640px){.field{grid-template-columns:1fr}.field .meta{grid-column:1}}
+.note{border-left:3px solid var(--warn);padding:6px 10px;background:color-mix(in srgb,var(--warn) 8%,transparent);border-radius:4px;margin:8px 0}.ok{color:var(--ok)}
 .grid2{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:16px}
 </style>
 </head>
@@ -45,7 +48,7 @@ pre{white-space:pre-wrap;word-break:break-word;background:var(--bg);padding:8px;
   <button class="act" id="signin">Sign in</button> <span id="loginErr" class="err"></span>
 </div>
 <div id="app" hidden>
-<header><h1><img class="brand on-light" src="/brand/sampaudience-logo-light.svg" alt="SampAudience by Sampledge"><img class="brand on-dark" src="/brand/sampaudience-logo-dark.svg" alt="SampAudience by Sampledge"><span class="muted" style="font-weight:500">Operations</span></h1><span class="who" id="who"></span><button class="ghost" id="refresh">Refresh</button><button class="ghost" id="out">Sign out</button></header>
+<header><h1><img class="brand on-light" src="/brand/sampaudience-logo-light.svg" alt="SampAudience by Sampledge"><img class="brand on-dark" src="/brand/sampaudience-logo-dark.svg" alt="SampAudience by Sampledge"><span class="muted" style="font-weight:500">Operations</span></h1><span class="who" id="who"></span><button class="ghost" id="settingsBtn" hidden>Settings</button><button class="ghost" id="refresh">Refresh</button><button class="ghost" id="out">Sign out</button></header>
 <main>
   <div class="tiles" id="tiles"></div>
   <div class="grid2">
@@ -63,6 +66,16 @@ pre{white-space:pre-wrap;word-break:break-word;background:var(--bg);padding:8px;
     <table id="requests"></table>
   </section>
   <section id="detail" hidden></section>
+  <section id="settingsBox" hidden>
+    <h2>Settings: API keys and connections</h2>
+    <p class="muted">Everything here is saved in the SampAudience database, so nothing has to be added to the server. Secrets are encrypted and never shown again after saving; leave a secret box empty to keep the saved one.</p>
+    <div id="settingsMsg"></div>
+    <div id="settingsGroups"></div>
+    <h2 style="margin-top:18px">Connected systems</h2>
+    <p class="muted">SampTrek, SampCode, SUPPLY360 and outside survey hosts. Each signs its calls with its signing secret; give the secret to that system once, when it is shown.</p>
+    <div id="clients"></div>
+    <details style="margin-top:10px"><summary>Add or change a connected system</summary><div id="clientForm" style="margin-top:8px"></div></details>
+  </section>
   <section id="failBox" hidden><h2>Integration failures</h2><div id="fails"></div></section>
 </main>
 </div>
@@ -77,14 +90,14 @@ pre{white-space:pre-wrap;word-break:break-word;background:var(--bg);padding:8px;
   const api = async (method, path, body) => {
     const r = await fetch(path, { method, headers: { authorization: 'Bearer ' + token, ...(body ? { 'content-type': 'application/json' } : {}) }, body: body ? JSON.stringify(body) : undefined });
     const data = await r.json().catch(() => ({}));
-    if (!r.ok) throw new Error(data.error || ('HTTP ' + r.status));
+    if (!r.ok) { const err = new Error(data.error || ('HTTP ' + r.status)); err.details = Array.isArray(data.details) ? data.details : null; throw err; }
     return data;
   };
   const n = (x) => (x ?? 0).toLocaleString();
   const can = (...roles) => me && roles.includes(me.role);
 
   async function signIn() {
-    try { me = await api('GET', '/api/v1/me'); $('#login').hidden = true; $('#app').hidden = false; $('#who').textContent = me.name + ' · ' + me.role.replace('_', ' '); load(); }
+    try { me = await api('GET', '/api/v1/me'); $('#login').hidden = true; $('#app').hidden = false; $('#who').textContent = me.name + ' · ' + me.role.replace('_', ' '); $('#settingsBtn').hidden = me.role !== 'supply_admin'; load(); }
     catch (e) { $('#login').hidden = false; $('#app').hidden = true; $('#loginErr').textContent = token ? e.message : ''; }
   }
   $('#signin').onclick = () => { token = $('#tok').value.trim(); store.set(token); signIn(); };
@@ -173,6 +186,62 @@ pre{white-space:pre-wrap;word-break:break-word;background:var(--bg);padding:8px;
       ...rows.map((r) => el('tr', {}, el('td', {}, new Date(r.when).toLocaleString()), el('td', {}, r.what), el('td', {}, r.err.slice(0, 160)),
         el('td', {}, r.id && can('supply_admin', 'supply_manager') ? el('button', { class: 'ghost', on: { click: async () => { await api('POST', '/api/v1/dashboard/failures/' + r.id + '/replay'); load(); } } }, 'Replay') : '')))) : el('p', { class: 'muted' }, 'No failures'));
   }
+
+  // ---- Settings (supply admins): API keys and connections kept in the database
+  const sourceLabel = (f) => f.source === 'database' ? 'Saved here' + (f.updatedAt ? ' · ' + new Date(f.updatedAt).toLocaleString() : '') : f.source === 'environment' ? 'From the server environment (' + f.env + '); save a value here to replace it' : 'Not set';
+  const msg = (box, text, ok) => { $(box).replaceChildren(text ? el('p', { class: ok ? 'ok' : 'err' }, text) : ''); };
+  async function loadSettings() {
+    const v = await api('GET', '/api/v1/admin/settings');
+    const groups = v.groups.map((g) => {
+      const inputs = {};
+      const rows = g.fields.map((f) => {
+        const input = f.options ? el('select', { 'aria-label': f.label }, el('option', { value: '' }, '(not set)'), ...f.options.map((o) => el('option', { value: o }, o)))
+          : el('input', { type: f.secret ? 'password' : 'text', autocomplete: 'off', placeholder: f.secret ? (f.set ? 'Saved ' + (f.hint || '') + ' (leave empty to keep)' : (f.placeholder || '')) : (f.placeholder || ''), 'aria-label': f.label });
+        if (!f.secret) input.value = f.value || '';
+        inputs[f.key] = input;
+        const remove = f.source === 'database' ? el('button', { class: 'ghost', type: 'button', on: { click: async () => { try { await api('PUT', '/api/v1/admin/settings', { values: { [f.key]: null } }); msg('#settingsMsg', f.label + ' removed.', true); loadSettings(); } catch (e) { msg('#settingsMsg', e.message); } } } }, 'Remove') : '';
+        return [el('label', {}, f.label), el('div', { class: 'row', style: 'margin:0;flex-wrap:nowrap' }, input, remove),
+          el('div', { class: 'meta' }, (f.unreadable ? '⚠ The saved value cannot be opened (the encryption key changed); enter it again. ' : '') + sourceLabel(f) + (f.help ? ' · ' + f.help : ''))];
+      });
+      const result = el('span', { class: 'muted' });
+      const save = el('button', { class: 'act', type: 'button', on: { click: async () => {
+        const values = {};
+        for (const f of g.fields) { const x = inputs[f.key].value.trim(); if (f.secret) { if (x) values[f.key] = x; } else if (x !== (f.value || '')) values[f.key] = x; }
+        try { const r = await api('PUT', '/api/v1/admin/settings', { values }); msg('#settingsMsg', r.changed.length ? 'Saved: ' + r.changed.length + ' change(s). In use now, no restart needed.' : 'Nothing changed.', true); loadSettings(); }
+        catch (e) { msg('#settingsMsg', e.message + (e.details ? ': ' + e.details.map((d) => d.message).join('; ') : '')); }
+      } } }, 'Save');
+      const test = el('button', { class: 'ghost', type: 'button', on: { click: async () => { result.textContent = 'Testing…'; try { const r = await api('POST', '/api/v1/admin/settings/test/' + g.id); result.className = r.ok ? 'ok' : 'err'; result.textContent = r.message; } catch (e) { result.className = 'err'; result.textContent = e.message; } } } }, 'Test');
+      return el('fieldset', { style: 'border:1px solid var(--line);border-radius:8px;padding:10px 12px;margin:0 0 12px' }, el('legend', { style: 'padding:0 6px;font-weight:600' }, g.label), el('p', { class: 'muted', style: 'margin:0 0 6px' }, g.summary),
+        ...rows.map((r) => el('div', { class: 'field' }, ...r)), el('div', { class: 'row', style: 'margin-top:8px' }, save, test, result));
+    });
+    $('#settingsGroups').replaceChildren(...(v.encryption.keySource === 'database' ? [el('div', { class: 'note' }, v.encryption.note)] : []), ...groups);
+    loadClients();
+  }
+  const showOnce = (issued) => { const parts = []; if (issued.secret) parts.push('Signing secret: ' + issued.secret); if (issued.outcomeSecret) parts.push('Outcome secret: ' + issued.outcomeSecret); if (parts.length) $('#settingsMsg').replaceChildren(el('div', { class: 'note' }, el('strong', {}, 'Copy now, shown only once. '), el('pre', {}, parts.join('\n')))); };
+  async function loadClients() {
+    const { data } = await api('GET', '/api/v1/admin/clients');
+    $('#clients').replaceChildren(el('table', {}, el('tr', {}, ...['System', 'Id', 'Kind', 'Events sent to', 'Signing secret', 'Outcome secret', 'Status', ''].map((h) => el('th', {}, h))),
+      ...(data.length ? data.map((c) => el('tr', {}, el('td', {}, c.name), el('td', {}, c.id), el('td', {}, productName(c.system)), el('td', {}, c.webhookUrl || '–'),
+        el('td', {}, (c.secretHint || 'set') + (c.previousSecretActive ? ' (previous still accepted)' : '')), el('td', {}, c.outcomeSecretSet ? (c.outcomeSecretHint || 'set') : '–'), el('td', {}, c.active ? 'active' : 'off'),
+        el('td', {}, el('button', { class: 'ghost', on: { click: async () => { if (!confirm('Create a new signing secret for ' + c.name + '? The current one keeps working until you retire it.')) return; try { showOnce((await api('POST', '/api/v1/admin/clients/' + encodeURIComponent(c.id) + '/rotate', {})).issued); loadClients(); } catch (e) { msg('#settingsMsg', e.message); } } } }, 'New secret'), ' ',
+          c.previousSecretActive ? el('button', { class: 'ghost', on: { click: async () => { try { await api('POST', '/api/v1/admin/clients/' + encodeURIComponent(c.id) + '/retire-previous', {}); loadClients(); } catch (e) { msg('#settingsMsg', e.message); } } } }, 'Retire previous') : '')))
+        : [el('tr', {}, el('td', { colspan: 8, class: 'muted' }, 'No connected systems yet'))])));
+  }
+  function clientForm() {
+    const f = { id: el('input', { placeholder: 'projexa' }), system: el('select', {}, ...['PROJEXA', 'ZAPX', 'SUPPLY360', 'EXTERNAL'].map((s) => el('option', { value: s }, productName(s)))), name: el('input', { placeholder: 'SampTrek' }),
+      webhookUrl: el('input', { placeholder: 'https://…/api/v1/integrations/sampleon/events' }), secret: el('input', { type: 'password', autocomplete: 'off', placeholder: 'Empty: keep it, or create one for a new system' }),
+      outcome: el('select', {}, el('option', { value: '' }, 'Keep as it is'), el('option', { value: 'generate' }, 'Create one (survey hosts)'), el('option', { value: 'remove' }, 'Remove')) };
+    const row = (label, input) => el('div', { class: 'field' }, el('label', {}, label), input);
+    $('#clientForm').replaceChildren(row('Client id', f.id), row('Kind', f.system), row('Name', f.name), row('Events sent to (webhook)', f.webhookUrl), row('Signing secret', f.secret), row('Outcome secret', f.outcome),
+      el('button', { class: 'act', on: { click: async () => {
+        const body = { id: f.id.value.trim(), system: f.system.value, name: f.name.value.trim(), webhookUrl: f.webhookUrl.value.trim() || null };
+        if (f.secret.value.trim()) body.secret = f.secret.value.trim();
+        if (f.outcome.value === 'generate') body.outcomeSecret = 'generate'; else if (f.outcome.value === 'remove') body.outcomeSecret = null;
+        try { const r = await api('POST', '/api/v1/admin/clients', body); showOnce(r.issued); if (!r.issued.secret && !r.issued.outcomeSecret) msg('#settingsMsg', r.client.name + ' saved.', true); f.secret.value = ''; loadClients(); }
+        catch (e) { msg('#settingsMsg', e.message + (e.details ? ': ' + e.details.map((d) => d.path + ' ' + d.message).join('; ') : '')); }
+      } } }, 'Save system'));
+  }
+  $('#settingsBtn').onclick = () => { const b = $('#settingsBox'); b.hidden = !b.hidden; if (!b.hidden) { clientForm(); loadSettings().catch((e) => msg('#settingsMsg', e.message)); b.scrollIntoView({ behavior: 'smooth' }); } };
 
   $('#parse').onclick = async () => { const out = $('#nlOut'); out.hidden = false; try { out.textContent = JSON.stringify(await api('POST', '/api/v1/targeting/parse', { text: $('#nl').value }), null, 2); } catch (e) { out.textContent = e.message; } };
   signIn();
